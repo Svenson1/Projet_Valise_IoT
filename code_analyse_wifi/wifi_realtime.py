@@ -20,7 +20,7 @@ notre cycle d'affichage). Le reste -- lecture du radar, lecture clavier
     timeout, ce qui evite un thread+queue tout en reagissant plus vite
     qu'un sleep(1) classique
 
-Affichage console en deux zones, rafraichi chaque seconde :
+Affichage console en deux zones, rafraichi chaque 2 seconde :
   1. Table des reseaux detectes par le radar (numero de selection STABLE :
      ordre de premiere detection, jamais retrie, pour que le numero tape
      par l'operateur reste valide entre deux rafraichissements)
@@ -164,11 +164,14 @@ class DiscoveryRadar:
     d'un tick a l'autre.
     """
 
+    STALE_TIMEOUT = 15  # secondes sans etre revu avant qu'un reseau soit retire de la liste
+
     def __init__(self, iface, csv_prefix):
         self.iface = iface
         self.csv_prefix = csv_prefix
         self._networks = {}
         self._order = []
+        self._last_seen = {}
         self._proc = None
 
     def start(self):
@@ -186,6 +189,8 @@ class DiscoveryRadar:
         with open(csv_file, errors="replace") as f:
             lines = f.read().splitlines()
         reader = csv.DictReader(lines, fieldnames=RADAR_FIELDNAMES)
+
+        now = time.time()
         for row in reader:
             if row["BSSID"] in (None, "BSSID"):
                 continue
@@ -198,6 +203,18 @@ class DiscoveryRadar:
             if bssid not in self._networks:
                 self._order.append(bssid)
             self._networks[bssid] = row
+            self._last_seen[bssid] = now
+
+        # Purge les reseaux absents du CSV depuis STALE_TIMEOUT secondes : sans
+        # ca, un AP hors de portee reste affiche indefiniment avec sa derniere
+        # Power connue. Le delai evite de faire disparaitre/reapparaitre un
+        # reseau pour un seul beacon manque sur une ecriture CSV.
+        stale = [b for b, t in self._last_seen.items() if now - t > self.STALE_TIMEOUT]
+        for bssid in stale:
+            self._networks.pop(bssid, None)
+            self._last_seen.pop(bssid, None)
+            if bssid in self._order:
+                self._order.remove(bssid)
 
     def get_networks(self):
         """Liste des reseaux dans l'ordre stable de decouverte (index = numero de selection)."""
