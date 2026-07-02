@@ -20,7 +20,7 @@ notre cycle d'affichage). Le reste -- lecture du radar, lecture clavier
     timeout, ce qui evite un thread+queue tout en reagissant plus vite
     qu'un sleep(1) classique
 
-Affichage console en deux zones, rafraichi chaque 2 seconde :
+Affichage console en deux zones, rafraichi chaque seconde :
   1. Table des reseaux detectes par le radar (numero de selection STABLE :
      ordre de premiere detection, jamais retrie, pour que le numero tape
      par l'operateur reste valide entre deux rafraichissements)
@@ -41,7 +41,7 @@ import sys
 import signal
 from datetime import datetime
 
-REFRESH_INTERVAL = 2.0  # seconds between display refreshes
+REFRESH_INTERVAL = 1.0  # seconds between display refreshes
 RADAR_CSV_DIR = "radar_csv"
 
 RADAR_FIELDNAMES = ['BSSID', 'First_time_seen', 'Last_time_seen', 'channel', 'Speed',
@@ -164,14 +164,11 @@ class DiscoveryRadar:
     d'un tick a l'autre.
     """
 
-    STALE_TIMEOUT = 15  # secondes sans etre revu avant qu'un reseau soit retire de la liste
-
     def __init__(self, iface, csv_prefix):
         self.iface = iface
         self.csv_prefix = csv_prefix
         self._networks = {}
         self._order = []
-        self._last_seen = {}
         self._proc = None
 
     def start(self):
@@ -189,8 +186,6 @@ class DiscoveryRadar:
         with open(csv_file, errors="replace") as f:
             lines = f.read().splitlines()
         reader = csv.DictReader(lines, fieldnames=RADAR_FIELDNAMES)
-
-        now = time.time()
         for row in reader:
             if row["BSSID"] in (None, "BSSID"):
                 continue
@@ -203,18 +198,6 @@ class DiscoveryRadar:
             if bssid not in self._networks:
                 self._order.append(bssid)
             self._networks[bssid] = row
-            self._last_seen[bssid] = now
-
-        # Purge les reseaux absents du CSV depuis STALE_TIMEOUT secondes : sans
-        # ca, un AP hors de portee reste affiche indefiniment avec sa derniere
-        # Power connue. Le delai evite de faire disparaitre/reapparaitre un
-        # reseau pour un seul beacon manque sur une ecriture CSV.
-        stale = [b for b, t in self._last_seen.items() if now - t > self.STALE_TIMEOUT]
-        for bssid in stale:
-            self._networks.pop(bssid, None)
-            self._last_seen.pop(bssid, None)
-            if bssid in self._order:
-                self._order.remove(bssid)
 
     def get_networks(self):
         """Liste des reseaux dans l'ordre stable de decouverte (index = numero de selection)."""
@@ -318,46 +301,40 @@ class TargetListener:
 
 def render(networks, listener):
     lines = []
-    lines.append("=" * 100)  # Élargi un peu pour la nouvelle colonne
+    lines.append("=" * 110)
     lines.append(" RADAR - reseaux detectes (tape un numero + Entree pour ecouter un reseau)")
-    lines.append("=" * 100)
-    # Ajout de la colonne AGE (le 's' pour secondes)
+    lines.append("=" * 110)
     lines.append(f"{'No':<4}{'BSSID':<20}{'CH':<5}{'PWR':<6}{'AGE':<6}{'ESSID':<28}{'CHIFFREMENT'}")
-
     now = time.time()
     for i, net in enumerate(networks):
         essid = (net.get("ESSID") or "").strip()
         essid = essid[:26] if essid else "<SSID masque>"
-
-        # --- CALCUL DE L'AGE ---
-        # On récupère la string d'airodump 'YYYY-MM-DD HH:MM:SS'
-        last_seen_str = net.get("Last_time_seen", "").strip()
+        last_seen_str = net.get("last_seen", "").strip()
         age_str = "?"
-        try:
-            dt = datetime.strptime(last_seen_str, "%Y-%m-%d %H:%M:%S")
-            age_seconds = int(now - dt.timestamp())
-            # On capte les valeurs négatives bizarres dues aux micros-décalages d'horloge
-            if age_seconds < 0:
-                age_seconds = 0
-            age_str = f"{age_seconds}s"
-        except ValueError:
-            pass
-        # -----------------------
+        if last_seen_str:
+            try:
+                dt = datetime.strptime(last_seen_str, "%Y-%m-%d %H:%M:%S")
+                age_seconds = int(now - dt.timestamp())
+                if age_seconds < 0:
+                    age_seconds = 0
+                age_str = f"{age_seconds}s"
+            except ValueError:
+                pass
 
         lines.append(f"{i:<4}{net.get('BSSID', ''):<20}{net.get('channel', ''):<5}"
                      f"{net.get('Power', ''):<6}{age_str:<6}{essid:<28}{net.get('Privacy', '')}")
 
     lines.append("")
-    lines.append("=" * 90)
+    lines.append("=" * 110)
     if listener.current_bssid:
         lines.append(f" ECOUTE EN COURS : {listener.current_essid or '(SSID inconnu)'} "
                       f"({listener.current_bssid}) - canal {listener.current_channel}")
     else:
         lines.append(" ECOUTE EN COURS : aucune (choisis un reseau ci-dessus)")
-    lines.append("=" * 90)
+    lines.append("=" * 110)
     clients = listener.get_clients()
     if not clients:
-        lines.append("  (aucun client detecte pour le moment)")
+        lines.append("(aucun client detecte pour le moment)")
     else:
         for mac, vendor in sorted(clients.items()):
             lines.append(f"  - {mac}  ({vendor or 'vendor inconnu'})")
