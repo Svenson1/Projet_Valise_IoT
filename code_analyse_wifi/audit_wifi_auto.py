@@ -15,6 +15,10 @@ active_wireless_networks = []
 # on one of these is "cleaner" RF-wise, which we use as a small bonus in scoring.
 NON_OVERLAPPING_CHANNELS = {1, 6, 11}
 
+# Output folder for the final report (phase 2), kept separate from the .pcap
+# files so the working directory doesn't get cluttered.
+REPORT_OUTPUT_DIR = "reports"
+
 
 def check_for_bssid(bssid, lst):
     if len(lst) == 0:
@@ -76,7 +80,7 @@ timestamped backup/ folder instead of deleting them, so nothing is lost.
 """
 
 
-wlan_pattern = re.compile("^wlan[0-9]+")
+wlan_pattern = re.compile("wlan[0-9]+")
 check_wifi_result = wlan_pattern.findall(subprocess.run(["iwconfig"], capture_output=True).stdout.decode())
 
 if len(check_wifi_result) == 0:
@@ -248,7 +252,6 @@ process keeps writing to disk and holding the monitor interface, which can
 conflict with the targeted capture phase that follows.
 """
 
-
 # =============================================================================
 # AUTOMATIC BEST-AP SELECTION
 # =============================================================================
@@ -385,6 +388,12 @@ if confirm == "n":
 
 CAPTURE_TIME = 60  # seconds per target, adjust to taste
 
+# Every .pcap file successfully produced during this loop is collected here,
+# so phase 2 (the report) knows exactly which files to analyze afterwards --
+# no need to re-scan the whole working directory and risk picking up old
+# captures from a previous run.
+captured_pcaps = []
+
 for score, n_clients, net in best_aps:
     bssid = net["BSSID"]
     channel = net["channel"]
@@ -407,8 +416,10 @@ for score, n_clients, net in best_aps:
 
     cap_file = f"{prefix}-01.cap"
     if os.path.exists(cap_file):
-        os.rename(cap_file, f"{prefix}.pcap")
-        print(f"-> Capture sauvegardée : {prefix}.pcap")
+        final_name = f"{prefix}.pcap"
+        os.rename(cap_file, final_name)
+        captured_pcaps.append(final_name)
+        print(f"-> Capture sauvegardée : {final_name}")
     else:
         print(f"-> Aucun fichier de capture généré pour {essid}.")
 
@@ -422,6 +433,32 @@ per-target CSVs) a much better chance of being captured.
 We use --output-format pcap to get a `.cap` file directly compatible with
 Wireshark/tshark, then rename it to `.pcap` purely for naming clarity (no
 functional difference -- aircrack-ng's .cap IS the pcap format).
+"""
+
+
+# =============================================================================
+# PHASE 2 (AUTOMATIC): ANALYZE THE CAPTURES AND BUILD THE REPORT
+# =============================================================================
+
+if captured_pcaps:
+    print(f"\n=== Phase 2 : analyse automatique de {len(captured_pcaps)} capture(s) ===")
+    import wifi_report  # local module, must sit next to this script
+    report_path = wifi_report.run_full_report(captured_pcaps, output_dir=REPORT_OUTPUT_DIR)
+    if report_path:
+        print(f"\nPipeline termine. Rapport disponible : {report_path}")
+else:
+    print("\nAucune capture exploitable, phase 2 (analyse) ignoree.")
+
+"""
+Automatic phase 2:
+Instead of asking the operator to run "python3 wifi_report.py *.pcap" by
+hand once captures are done, we import wifi_report.py as a regular Python
+module (it lives in the same folder as this script) and call its
+run_full_report() function directly, passing it the exact list of .pcap
+files produced above. This skips subprocess/argparse entirely -- it's a
+plain in-process function call, which is simpler and faster than spawning
+a second Python process. The single combined report (networks then MAC
+addresses) ends up in the REPORT_OUTPUT_DIR folder.
 """
 
 print("\nTerminé. Pense à repasser l'interface en mode managed avec :")
