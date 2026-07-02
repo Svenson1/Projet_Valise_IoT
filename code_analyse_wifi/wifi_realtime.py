@@ -41,7 +41,7 @@ import sys
 import signal
 from datetime import datetime
 
-REFRESH_INTERVAL = 1.0  # seconds between display refreshes
+REFRESH_INTERVAL = 2.0  # seconds between display refreshes
 RADAR_CSV_DIR = "radar_csv"
 
 RADAR_FIELDNAMES = ['BSSID', 'First_time_seen', 'Last_time_seen', 'channel', 'Speed',
@@ -317,34 +317,54 @@ class TargetListener:
 # =============================================================================
 
 def render(networks, listener):
-    sys.stdout.write("\033[2J\033[H")
-    sys.stdout.flush()
+    lines = []
+    lines.append("=" * 100)  # Élargi un peu pour la nouvelle colonne
+    lines.append(" RADAR - reseaux detectes (tape un numero + Entree pour ecouter un reseau)")
+    lines.append("=" * 100)
+    # Ajout de la colonne AGE (le 's' pour secondes)
+    lines.append(f"{'No':<4}{'BSSID':<20}{'CH':<5}{'PWR':<6}{'AGE':<6}{'ESSID':<28}{'CHIFFREMENT'}")
 
-    print("=" * 90)
-
-    print(" RADAR - reseaux detectes (tape un numero + Entree pour ecouter un reseau)")
-    print("=" * 90)
-    print(f"{'No':<4}{'BSSID':<20}{'CH':<5}{'PWR':<6}{'ESSID':<28}{'CHIFFREMENT'}")
+    now = time.time()
     for i, net in enumerate(networks):
-        essid = (net.get("ESSID") or "")[:26]
+        essid = (net.get("ESSID") or "").strip()
         essid = essid[:26] if essid else "<SSID masque>"
-        print(f"{i:<4}{net.get('BSSID', ''):<20}{net.get('channel', ''):<5}"
-              f"{net.get('Power', ''):<6}{essid:<28}{net.get('Privacy', '')}")
 
-    print()
-    print("=" * 90)
+        # --- CALCUL DE L'AGE ---
+        # On récupère la string d'airodump 'YYYY-MM-DD HH:MM:SS'
+        last_seen_str = net.get("Last_time_seen", "").strip()
+        age_str = "?"
+        try:
+            dt = datetime.strptime(last_seen_str, "%Y-%m-%d %H:%M:%S")
+            age_seconds = int(now - dt.timestamp())
+            # On capte les valeurs négatives bizarres dues aux micros-décalages d'horloge
+            if age_seconds < 0:
+                age_seconds = 0
+            age_str = f"{age_seconds}s"
+        except ValueError:
+            pass
+        # -----------------------
+
+        lines.append(f"{i:<4}{net.get('BSSID', ''):<20}{net.get('channel', ''):<5}"
+                     f"{net.get('Power', ''):<6}{age_str:<6}{essid:<28}{net.get('Privacy', '')}")
+
+    lines.append("")
+    lines.append("=" * 90)
     if listener.current_bssid:
-        print(f" ECOUTE EN COURS : {listener.current_essid or '(SSID inconnu)'} "
-              f"({listener.current_bssid}) - canal {listener.current_channel}")
+        lines.append(f" ECOUTE EN COURS : {listener.current_essid or '(SSID inconnu)'} "
+                      f"({listener.current_bssid}) - canal {listener.current_channel}")
     else:
-        print(" ECOUTE EN COURS : aucune (choisis un reseau ci-dessus)")
-    print("=" * 90)
+        lines.append(" ECOUTE EN COURS : aucune (choisis un reseau ci-dessus)")
+    lines.append("=" * 90)
     clients = listener.get_clients()
     if not clients:
-        print("  (aucun client detecte pour le moment)")
+        lines.append("  (aucun client detecte pour le moment)")
     else:
         for mac, vendor in sorted(clients.items()):
-            print(f"  - {mac}  ({vendor or 'vendor inconnu'})")
+            lines.append(f"  - {mac}  ({vendor or 'vendor inconnu'})")
+
+    frame = "\033[2J\033[3J\033[H" + "\n".join(lines) + "\n"
+    sys.stdout.write(frame)
+    sys.stdout.flush()
 
 
 # =============================================================================
