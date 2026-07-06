@@ -8,7 +8,8 @@ monitor simultanement :
     (airodump-ng sans --bssid/-c) pour lister tous les reseaux visibles
   - une interface "cible" fixee sur un seul canal/BSSID choisi
     manuellement, qui capture en DIRECT (tshark -i, pas de fichier pcap
-    intermediaire) les clients associes a ce reseau
+    intermediaire) l'AP et les clients associes a ce reseau, avec leur
+    puissance de signal (RSSI) pour faire de la goniometrie manuelle
 
 Design a UN SEUL thread de fond (le lecteur tshark de la cible, seul
 travail vraiment asynchrone : les paquets arrivent independamment de
@@ -24,10 +25,13 @@ Affichage console en deux zones, rafraichi chaque seconde :
   1. Table des reseaux detectes par le radar (numero de selection STABLE :
      ordre de premiere detection, jamais retrie, pour que le numero tape
      par l'operateur reste valide entre deux rafraichissements)
-  2. Reseau actuellement ecoute + liste des clients vus dessus
+  2. Reseau actuellement ecoute : AP + tous les clients vus dessus, avec
+     pour chacun : role (AP/CLIENT), RSSI instantane, RSSI moyenne
+     glissante, et age (secondes depuis la derniere trame recue de cette
+     station). Rien n'est jamais supprime de cette table -- l'age est
+     purement informatif, il sert a savoir si une entree est "fraiche"
+     ou obsolete, pas a la faire disparaitre.
 
-Usage:
-    sudo python3 wifi_realtime.py
 """
 
 import subprocess
@@ -39,10 +43,16 @@ import csv
 import os
 import sys
 import signal
+from collections import deque
 from datetime import datetime
 
-REFRESH_INTERVAL = 1.0  # seconds between display refreshes
+REFRESH_INTERVAL = 3.0  # seconds between display refreshes
 RADAR_CSV_DIR = "radar_csv"
+
+# How many recent RSSI samples to keep per station for the moving average.
+# 5 samples is a compromise: enough to smooth out per-packet noise (multipath,
+# reflections) without lagging too much behind a real approach/move-away.
+RSSI_HISTORY_LEN = 5
 
 RADAR_FIELDNAMES = ['BSSID', 'First_time_seen', 'Last_time_seen', 'channel', 'Speed',
                      'Privacy', 'Cipher', 'Authentication', 'Power', 'beacons', 'IV',
@@ -218,24 +228,74 @@ class DiscoveryRadar:
 
 class TargetListener:
     """
-    Possede l'interface B. switch_target() fixe le canal puis (re)lance un
-    tshark en direct (-i, pas de fichier pcap intermediaire) filtre sur un
-    seul BSSID. Un thread de fond lit sa sortie ligne par ligne des que des
-    paquets arrivent -- c'est le seul endroit du script ou un thread est
-    reellement necessaire, car cette arrivee est asynchrone par nature et
-    ne peut pas etre calee sur notre cycle d'affichage sans perdre des
-    paquets entre deux rafraichissements.
+    Owns interface B. switch_target() locks the radio channel, then (re)starts
+    a live tshark capture (-i, no intermediate pcap file) filtered on a single
+    BSSID. A background thread reads its output line by line as packets
+    arrive -- this is the only place in the script where a thread is truly
+    needed, since packet arrival is asynchronous by nature and cannot be
+    tied to our display refresh cycle without dropping packets in between.
+
+    DIRECTION-FINDING MODE (RSSI table)
+    ------------------------------------
+    Instead of only listing client MAC addresses, this class now builds a
+    unified "stations" table that includes BOTH the access point and every
+    client talking to it, each with a live RSSI reading. This is the data
+    source for the manual direction-finding workflow: walk around / rotate
+    the antenna, watch the RSSI of the station you're trying to locate, and
+    move towards higher values.
+
+    How AP vs client is determined (no separate lookup, just an addressing
+    rule applied to each captured frame):
+      - Beacon frames are sent by the AP; if the source address (wlan.sa)
+        equals the BSSID we're filtering on, the transmitter of this frame
+        is the AP itself.
+      - Data frames are exchanged between the AP and a client. If the BSSID
+        appears as the destination (wlan.da), then the source (wlan.sa) is
+        a client sending to the AP (uplink). We ignore the reverse
+        direction (AP -> client, i.e. wlan.sa == BSSID) for role
+        assignment there since that's already covered by the beacon case,
+        but it also feeds fresh RSSI samples for the AP.
+
+    Where the RSSI comes from: the radiotap header field `dbm_antsignal`,
+    which is metadata ADDED BY OUR OWN WIFI ADAPTER at capture time -- it is
+    not part of the 802.11 protocol itself. It reflects the signal strength
+    of that specific frame as received by OUR antenna, regardless of who
+    transmitted it. That's exactly the quantity we want for direction
+    finding: "how strong does this station's signal look to ME, right now".
+
+    Entries are never removed from the stations table (no timeout-based
+    eviction). Instead we track `last_seen` per station so the UI can show
+    an "age" column -- purely informational, to let the operator judge
+    whether a reading is fresh or stale, without the row disappearing and
+    breaking their mental map of who's on screen.
     """
 
-    FIELDS = ["wlan.bssid", "wlan.sa", "wlan.da", "wlan.sa_resolved", "wlan.da_resolved"]
+    # Field order matters: it must match the order of "-e" flags in the
+    # tshark command built in switch_target().
+    FIELDS = ["wlan.bssid", "wlan.sa", "wlan.da", "wlan.sa_resolved", "wlan.da_resolved",
+              "radiotap.dbm_antsignal"]
 
     def __init__(self, iface):
         self.iface = iface
         self.current_bssid = None
         self.current_essid = None
         self.current_channel = None
-        self._clients = {}
+
+        # Unified table: MAC address -> station info dict, for BOTH the AP
+        # and its clients. Keying by MAC (not by role) keeps this simple:
+        # there's exactly one entry per physical radio we've heard from.
+        #
+        # station info dict layout:
+        #   "role"      : "AP" or "CLIENT"
+        #   "vendor"    : resolved vendor string (best-effort, may be empty)
+        #   "pwr"       : most recent instantaneous RSSI in dBm (int) or None
+        #   "history"   : deque of the last RSSI_HISTORY_LEN RSSI samples,
+        #                 used to compute the moving average
+        #   "last_seen" : time.time() timestamp of the last frame that
+        #                 updated this entry
+        self._stations = {}
         self._lock = threading.Lock()
+
         self._proc = None
         self._reader_thread = None
         self._stop_event = threading.Event()
@@ -250,11 +310,20 @@ class TargetListener:
         self.current_essid = sanitize(essid)
         self.current_channel = channel
         with self._lock:
-            self._clients = {}
+            self._stations = {}
 
         self._stop_event = threading.Event()
+
+        # Filter is now just "wlan.bssid==<bssid>", with no wlan.fc.type
+        # restriction: we need BOTH beacon frames (type/subtype = management
+        # beacon, sent only by the AP, used to detect and refresh the AP's
+        # RSSI) and data frames (exchanged between AP and clients, used to
+        # detect and refresh each client's RSSI). Restricting to
+        # wlan.fc.type==2 (data only), as the previous client-only version
+        # did, would silently exclude the AP itself since APs don't send
+        # data frames to themselves.
         cmd = ["sudo", "tshark", "-i", self.iface, "-l", "-T", "fields",
-               "-E", "separator=,", "-Y", f"wlan.bssid=={bssid} && wlan.fc.type==2"]
+               "-E", "separator=,", "-Y", f"wlan.bssid=={bssid}"]
         for field in self.FIELDS:
             cmd += ["-e", field]
 
@@ -263,22 +332,93 @@ class TargetListener:
         self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
         self._reader_thread.start()
 
+    def _update_station(self, mac, role, vendor, rssi):
+        """
+        Create or refresh one station's entry. Called with the lock already
+        NOT held -- this method acquires it itself, since it's called from
+        multiple points in _read_loop.
+        """
+        now = time.time()
+        with self._lock:
+            entry = self._stations.get(mac)
+            if entry is None:
+                entry = {
+                    "role": role,
+                    "vendor": vendor or "",
+                    "pwr": None,
+                    "history": deque(maxlen=RSSI_HISTORY_LEN),
+                    "last_seen": now,
+                }
+                self._stations[mac] = entry
+
+            # Role can only go from unknown to known, never flip -- a given
+            # MAC is either the AP or a client for the lifetime of this
+            # capture (it's tied to wlan.bssid, which doesn't change mid
+            # capture since we restart the whole tshark process on
+            # switch_target()).
+            entry["role"] = role
+            if vendor:
+                entry["vendor"] = vendor
+            entry["last_seen"] = now
+
+            if rssi is not None:
+                entry["pwr"] = rssi
+                entry["history"].append(rssi)
+
     def _read_loop(self):
         for line in self._proc.stdout:
             if self._stop_event.is_set():
                 break
             parts = line.strip().split(",")
-            if len(parts) < 5:
+            if len(parts) < 6:
                 continue
-            bssid, src, dst, src_vendor, dst_vendor = parts
-            with self._lock:
-                for mac, vendor in ((src, src_vendor), (dst, dst_vendor)):
-                    if mac and mac != bssid:
-                        self._clients[mac] = sanitize(vendor) or self._clients.get(mac, "")
+            bssid, src, dst, src_vendor, dst_vendor, dbm_raw = parts[:6]
 
-    def get_clients(self):
+            rssi = None
+            if dbm_raw:
+                try:
+                    # dbm_antsignal can occasionally hold multiple
+                    # comma-separated values if tshark's own field
+                    # separator collides with a multi-antenna reading;
+                    # in practice with separator="," this is rare, but
+                    # we defensively take the first token.
+                    rssi = int(dbm_raw.split()[0])
+                except ValueError:
+                    rssi = None
+
+            if src == bssid:
+                # Frame transmitted by the AP itself (beacon, or downlink
+                # data frame AP -> client). Either way, this sample tells
+                # us the AP's RSSI as seen by our antenna.
+                self._update_station(bssid, "AP", sanitize(src_vendor), rssi)
+            elif dst == bssid and src:
+                # Uplink data frame: client -> AP. The transmitter (src) is
+                # a client of this network.
+                self._update_station(src, "CLIENT", sanitize(src_vendor), rssi)
+            # Any other combination (e.g. broadcast/malformed frames that
+            # slipped through the display filter) is ignored: we can't
+            # reliably attribute it to a role.
+
+    def get_stations(self):
+        """
+        Returns a plain-dict snapshot of the stations table, safe to read
+        without holding the lock afterwards. Moving average is computed
+        here rather than stored, since it's cheap and only needed at
+        render time.
+        """
         with self._lock:
-            return dict(self._clients)
+            snapshot = {}
+            for mac, entry in self._stations.items():
+                history = entry["history"]
+                avg = sum(history) / len(history) if history else None
+                snapshot[mac] = {
+                    "role": entry["role"],
+                    "vendor": entry["vendor"],
+                    "pwr": entry["pwr"],
+                    "avg": avg,
+                    "last_seen": entry["last_seen"],
+                }
+            return snapshot
 
     def _stop_current(self):
         self._stop_event.set()
@@ -332,12 +472,37 @@ def render(networks, listener):
     else:
         lines.append(" ECOUTE EN COURS : aucune (choisis un reseau ci-dessus)")
     lines.append("=" * 110)
-    clients = listener.get_clients()
-    if not clients:
-        lines.append("(aucun client detecte pour le moment)")
+
+    # Direction-finding table: AP + clients, with instantaneous RSSI, moving
+    # average RSSI, and age. Sort order: AP always first (it's the anchor of
+    # the network), then clients sorted by strongest instantaneous signal
+    # first -- that's the ordering that's actually useful while walking
+    # around with the antenna: "what's closest / strongest right now" at
+    # the top.
+    stations = listener.get_stations()
+    header = f"{'MAC':<20}{'ROLE':<8}{'PWR':<7}{'AVG':<7}{'AGE':<6}{'VENDOR'}"
+    lines.append(header)
+    if not stations:
+        lines.append("(aucune trame recue pour le moment)")
     else:
-        for mac, vendor in sorted(clients.items()):
-            lines.append(f"  - {mac}  ({vendor or 'vendor inconnu'})")
+        def sort_key(item):
+            mac, info = item
+            is_client = info["role"] != "AP"
+            # AP (False) sorts before CLIENT (True); within clients, higher
+            # instantaneous power (closer to 0 dBm, i.e. stronger) first.
+            # Missing pwr (None) is pushed to the bottom via -999.
+            pwr_for_sort = info["pwr"] if info["pwr"] is not None else -999
+            return (is_client, -pwr_for_sort)
+
+        for mac, info in sorted(stations.items(), key=sort_key):
+            pwr_str = f"{info['pwr']}" if info["pwr"] is not None else "?"
+            avg_str = f"{info['avg']:.1f}" if info["avg"] is not None else "?"
+            age_seconds = int(now - info["last_seen"])
+            if age_seconds < 0:
+                age_seconds = 0
+            age_str = f"{age_seconds}s"
+            vendor = info["vendor"] or "vendor inconnu"
+            lines.append(f"{mac:<20}{info['role']:<8}{pwr_str:<7}{avg_str:<7}{age_str:<6}{vendor}")
 
     frame = "\033[2J\033[3J\033[H" + "\n".join(lines) + "\n"
     sys.stdout.write(frame)
