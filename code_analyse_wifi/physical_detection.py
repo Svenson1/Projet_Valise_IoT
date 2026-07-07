@@ -32,6 +32,8 @@ Affichage console en deux zones, rafraichi chaque seconde :
      purement informatif, il sert a savoir si une entree est "fraiche"
      ou obsolete, pas a la faire disparaitre.
 
+Usage:
+    sudo python3 wifi_realtime.py
 """
 
 import subprocess
@@ -48,6 +50,13 @@ from datetime import datetime
 
 REFRESH_INTERVAL = 3.0  # seconds between display refreshes
 RADAR_CSV_DIR = "radar_csv"
+
+# Networks not seen (per airodump-ng's own Last_time_seen field) for longer
+# than this are dropped from the radar table. Unlike the direction-finding
+# table in TargetListener, here we DO want removal: airodump-ng's CSV never
+# forgets a BSSID on its own (see project notes), so without active pruning
+# the radar list only ever grows, including networks that are long gone.
+STALE_TIMEOUT = 60  # seconds
 
 # How many recent RSSI samples to keep per station for the moving average.
 # 5 samples is a compromise: enough to smooth out per-packet noise (multipath,
@@ -208,6 +217,37 @@ class DiscoveryRadar:
             if bssid not in self._networks:
                 self._order.append(bssid)
             self._networks[bssid] = row
+
+        self._purge_stale()
+
+    def _purge_stale(self):
+        """
+        Drop any BSSID whose airodump-ng Last_time_seen is older than
+        STALE_TIMEOUT. Called once per poll(), after the CSV re-read, so
+        stale entries never survive more than one tick past their timeout.
+
+        Parsing Last_time_seen here mirrors exactly what render() already
+        does to compute the AGE column -- kept as a small local helper
+        instead of a shared function to avoid coupling poll()'s internal
+        purging logic to the display code.
+        """
+        now = time.time()
+        stale_bssids = []
+        for bssid, row in self._networks.items():
+            last_seen_str = (row.get("Last_time_seen") or "").strip()
+            if not last_seen_str:
+                continue  # no timestamp to judge by: never purge on missing data
+            try:
+                dt = datetime.strptime(last_seen_str, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+            age_seconds = now - dt.timestamp()
+            if age_seconds > STALE_TIMEOUT:
+                stale_bssids.append(bssid)
+
+        for bssid in stale_bssids:
+            del self._networks[bssid]
+            self._order.remove(bssid)
 
     def get_networks(self):
         """Liste des reseaux dans l'ordre stable de decouverte (index = numero de selection)."""
