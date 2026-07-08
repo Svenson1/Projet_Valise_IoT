@@ -37,10 +37,10 @@ SERVEUR WEB (Flask + SSE)
 Un mini serveur Flask tourne dans un thread de fond des le lancement du
 script, et sert le dernier snapshot en continu a un navigateur distant
 (telephone/tablette connecte au hotspot du Pi -- voir
-MISE_EN_PLACE_HOTSPOT.md) via Server-Sent Events (SSE), PAS des websockets
-ou du Flask-SocketIO : SSE utilise l'API navigateur native EventSource, donc
-zero librairie JS externe a charger -- important puisque le hotspot n'a pas
-d'acces a internet, un CDN pour un client socket.io ne fonctionnerait pas.
+MISE_EN_PLACE_HOTSPOT.md) via Server-Sent Events (SSE)
+
+--------------------------------------------
+Ajout calcul de distance via 2 EMA afin de capter les tendances, On se rapproche ou on s'elloigne ?
 
 Usage:
     sudo python3 wifi_realtime.py
@@ -80,6 +80,22 @@ RSSI_HISTORY_LEN = 5
 # --- Web dashboard settings -------------------------------------------------
 WEB_HOST = "0.0.0.0"  # listen on every interface (including the hotspot's wlan0), not just localhost
 WEB_PORT = 5000
+
+#----------------EMA Information--------------------
+EMA_FAST_ALPHA = 0.5 #react quickly to change of PWR
+EMA_SLOW_ALPHA = 0.05 #ract slowly
+
+#for not changing every second between fast and slow, we add a limit
+TREND_HYSTERESIS_DB = 1.5 #change smaller than 1.5 dB are not notified
+
+
+#----------Distance Estimation------------------
+# d = 10 ^ ((P0 - PWR_filtered) / (10 * n))
+#   P0 = reference RSSI at 1 meter (dBm)
+#   n  = path loss exponent (environment-dependent)
+# These are generic literature averages, NOT calibrated for this hardware/ environment
+PATH_LOSS_P0 = -38.0   # dBm at 1m
+PATH_LOSS_N = 3.2      # typical indoor value
 
 RADAR_FIELDNAMES = ['BSSID', 'First_time_seen', 'Last_time_seen', 'channel', 'Speed',
                      'Privacy', 'Cipher', 'Authentication', 'Power', 'beacons', 'IV',
@@ -183,6 +199,26 @@ def enable_monitor_mode(iface):
         return candidate
     return iface
 
+
+def estimate_distance(pwr_filtered) :
+    """
+    Convert a filtered RSSI value into an estimated distance in m.
+    """
+    if pwr_filtered is None:
+        return None
+    return 10**((PATH_LOSS_P0 -pwr_filtered)/(10*PATH_LOSS_N))
+#formule found in "Robust Indoor Positioning Provided by Real-Time RSSI Values in Unmodified WLAN Networks"
+
+
+def compute_trend(ema_fast, ema_slow):
+    if ema_fast is None or ema_slow is None:
+        return None
+    delta = ema_fast - ema_slow
+    if delta > TREND_HYSTERESIS_DB :
+        return "approche"
+    elif delta < TREND_HYSTERESIS_DB :
+        return "eloigne"
+    return "stable"
 
 # =============================================================================
 # RADAR : lecture synchrone du CSV, appelee depuis la boucle principale
@@ -386,6 +422,8 @@ class TargetListener:
                     "vendor": vendor or "",
                     "pwr": None,
                     "history": deque(maxlen=RSSI_HISTORY_LEN),
+                    "ema_slow": None,
+                    "ema_fast": None, #for the trend comparison and distance estimate
                     "last_seen": now,
                 }
                 self._stations[mac] = entry
@@ -398,6 +436,12 @@ class TargetListener:
             if rssi is not None:
                 entry["pwr"] = rssi
                 entry["history"].append(rssi)
+                if entry["ema_fast"] is None:
+                    entry["ema_slow"] = float(rssi)
+                    entry["ema_fast"] = float(rssi)
+                else:
+                    entry["ema_slow"] = EMA_SLOW_ALPHA * rssi + (1-EMA_SLOW_ALPHA) * entry["ema_slow"]
+                    entry["ema_fast"] = EMA_FAST_ALPHA * rssi + (1-EMA_FAST_ALPHA) * entry["ema_fast"]
 
     def _read_loop(self):
         for line in self._proc.stdout:
@@ -437,6 +481,8 @@ class TargetListener:
                     "vendor": entry["vendor"],
                     "pwr": entry["pwr"],
                     "avg": avg,
+                    "ema_slow": entry["ema_slow"],
+                    "ema_fast": entry["ema_fast"],
                     "last_seen": entry["last_seen"],
                 }
             return snapshot
@@ -532,6 +578,8 @@ def build_snapshot(networks, listener):
             "role": info["role"],
             "pwr": info["pwr"],
             "avg": round(info["avg"], 1) if info["avg"] is not None else None,
+            "distance_m": round(estimate_distance(info["ema_slow"]), 1) if info["ema_slow"] is not None else None,
+            "trend": compute_trend(info["ema_fast"], info["ema_slow"]),
             "age": age_seconds,
             "vendor": info["vendor"] or "vendor inconnu",
         })
@@ -565,15 +613,18 @@ def render_terminal(snapshot):
         lines.append(" ECOUTE EN COURS : aucune (choisis un reseau ci-dessus)")
     lines.append("=" * 110)
 
-    lines.append(f"{'MAC':<20}{'ROLE':<8}{'PWR':<7}{'AVG':<7}{'AGE':<6}{'VENDOR'}")
+    lines.append(f"{'MAC':<20}{'ROLE':<8}{'PWR':<7}{'AVG':<7}{'DIST':<8}{'TENDANCE':<10}{'AGE':<6}{'VENDOR'}")
     if not snapshot["stations"]:
         lines.append("(aucune trame recue pour le moment)")
     else:
         for st in snapshot["stations"]:
             pwr_str = f"{st['pwr']}" if st["pwr"] is not None else "?"
             avg_str = f"{st['avg']}" if st["avg"] is not None else "?"
+            dist_str = f"{st['distance_m']}m" if st["distance_m"] is not None else "?"
+            trend_str = st["trend"] or "?"
             age_str = f"{st['age']}s"
-            lines.append(f"{st['mac']:<20}{st['role']:<8}{pwr_str:<7}{avg_str:<7}{age_str:<6}{st['vendor']}")
+            lines.append(f"{st['mac']:<20}{st['role']:<8}{pwr_str:<7}{avg_str:<7}"
+                         f"{dist_str:<8}{trend_str:<10}{age_str:<6}{st['vendor']}")
 
     frame = "\033[2J\033[3J\033[H" + "\n".join(lines) + "\n"
     sys.stdout.write(frame)
@@ -626,6 +677,9 @@ DASHBOARD_HTML = """
     th { background: #222; }
     tr.ap { color: #ffd27f; font-weight: bold; }
     #listening { margin-bottom: 1em; color: #7fd; }
+    .trend-approche { color: #7fff7f; font-weight: bold; }
+    .trend-eloigne { color: #ff7f7f; font-weight: bold; }
+    .trend-stable { color: #999; }
   </style>
 </head>
 <body>
@@ -639,7 +693,7 @@ DASHBOARD_HTML = """
 
   <h2>Stations (AP + clients)</h2>
   <table id="stations">
-    <thead><tr><th>MAC</th><th>Role</th><th>PWR</th><th>AVG</th><th>AGE</th><th>Vendor</th></tr></thead>
+    <thead><tr><th>MAC</th><th>Role</th><th>PWR</th><th>AVG</th><th>Distance</th><th>Tendance</th><th>AGE</th><th>Vendor</th></tr></thead>
     <tbody></tbody>
   </table>
 
@@ -683,8 +737,11 @@ DASHBOARD_HTML = """
       for (const st of stations) {
         const row = document.createElement('tr');
         if (st.role === 'AP') row.classList.add('ap');
+        const distStr = st.distance_m != null ? `${st.distance_m}m` : '?';
+        const trendStr = st.trend || '?';
         row.innerHTML = `<td>${st.mac}</td><td>${st.role}</td>
                           <td>${st.pwr ?? '?'}</td><td>${st.avg ?? '?'}</td>
+                          <td>${distStr}</td><td class="trend-${trendStr}">${trendStr}</td>
                           <td>${st.age}s</td><td>${st.vendor}</td>`;
         tbody.appendChild(row);
       }
