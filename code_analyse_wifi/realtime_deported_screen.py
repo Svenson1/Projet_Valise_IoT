@@ -2,45 +2,30 @@
 """
 wifi_realtime.py
 
-Version temps reel du pipeline de scan Wi-Fi, deux interfaces en mode
-monitor simultanement :
-  - une interface "radar" qui fait du channel hopping en continu
-    (airodump-ng sans --bssid/-c) pour lister tous les reseaux visibles
-  - une interface "cible" fixee sur un seul canal/BSSID choisi
-    manuellement, qui capture en DIRECT (tshark -i, pas de fichier pcap
-    intermediaire) l'AP et les clients associes a ce reseau, avec leur
-    puissance de signal (RSSI) pour faire de la goniometrie manuelle
+Real-time Wi-Fi scanning pipeline using two interfaces in monitor mode:
+  - a "radar" interface doing continuous channel hopping (airodump-ng)
+    to list every visible network
+  - a "target" interface locked on one manually-selected channel/BSSID,
+    live-capturing (tshark -i, no intermediate pcap) the AP and its
+    associated clients with RSSI, for manual direction
+    finding and a "sonar" approach/retreat indicator
 
-Design a UN SEUL thread de fond pour la capture (le lecteur tshark de la
-cible, seul travail vraiment asynchrone : les paquets arrivent
-independamment de notre cycle d'affichage), PLUS un deuxieme thread pour
-le serveur web (voir plus bas). Le reste -- lecture du radar, lecture
-clavier -- se fait de facon synchrone dans la boucle principale :
-  - le CSV du radar est relu directement a chaque tick (I/O rapide, pas
-    besoin d'un thread dedie)
-  - la saisie clavier est geree via select.select() sur stdin avec un
-    timeout, ce qui evite un thread+queue tout en reagissant plus vite
-    qu'un sleep(1) classique
+Threading: a single background thread handles the target's live tshark
+capture (the only truly asynchronous work -- packets arrive independently
+of the display cycle). Everything else (radar CSV polling, keyboard input)
+runs synchronously in the main loop via select.select() with a timeout.
 
-SOURCE UNIQUE DE VERITE : build_snapshot()
--------------------------------------------
-Le calcul des donnees a afficher (ages, tri, moyennes RSSI, formatage) est
-fait UNE SEULE FOIS par tick, dans build_snapshot(), qui retourne un simple
-dict JSON-compatible. Deux "vues" different consomment ce meme dict :
-  - render_terminal() : ecrit ce dict au format texte ANSI dans le terminal
-  - le serveur web (Flask + Server-Sent Events) : encode ce dict en JSON et
-    le pousse aux navigateurs connectes
-Aucun calcul n'est duplique entre les deux ; seul le format de sortie change.
+Single source of truth: build_snapshot() computes all display data once
+per tick, as a plain JSON-serializable dict. Both render_terminal() (ANSI)
+and the Flask/SSE web dashboard consume that same dict without
+recomputing anything.
 
-SERVEUR WEB (Flask + SSE)
---------------------------
-Un mini serveur Flask tourne dans un thread de fond des le lancement du
-script, et sert le dernier snapshot en continu a un navigateur distant
-(telephone/tablette connecte au hotspot du Pi -- voir
-MISE_EN_PLACE_HOTSPOT.md) via Server-Sent Events (SSE)
+Web dashboard: a Flask app runs in a background thread, pushing the
+latest snapshot to connected browsers (phone/tablet on the Pi's hotspot)
+via Server-Sent Events.
 
---------------------------------------------
-Ajout calcul de distance via 2 EMA afin de capter les tendances, On se rapproche ou on s'elloigne ?
+Sonar feature: a dual-EMA RSSI trend detector (approaching / moving away
+/ stable) plus an informational distance estimate.
 
 Usage:
     sudo python3 wifi_realtime.py
@@ -65,58 +50,46 @@ from flask import Flask, Response, render_template_string
 REFRESH_INTERVAL = 3.0  # seconds between display refreshes
 RADAR_CSV_DIR = "radar_csv"
 
-# Networks not seen (per airodump-ng's own Last_time_seen field) for longer
-# than this are dropped from the radar table. Unlike the direction-finding
-# table in TargetListener, here we DO want removal: airodump-ng's CSV never
-# forgets a BSSID on its own (see project notes), so without active pruning
-# the radar list only ever grows, including networks that are long gone.
+# Networks not seen (per airodump-ng's Last_time_seen) for longer than this
+# are dropped from the radar table. airodump-ng's CSV never forgets a BSSID
+# on its own, so active pruning is needed here (unlike TargetListener).
 STALE_TIMEOUT = 60  # seconds
 
-# How many recent RSSI samples to keep per station for the moving average.
-# 5 samples is a compromise: enough to smooth out per-packet noise (multipath,
-# reflections) without lagging too much behind a real approach/move-away.
+# Samples kept per station for the simple moving average. 5 is a
+# compromise between smoothing per-packet noise and staying responsive.
 RSSI_HISTORY_LEN = 5
 
 # --- Web dashboard settings -------------------------------------------------
-WEB_HOST = "0.0.0.0"  # listen on every interface (including the hotspot's wlan0), not just localhost
+WEB_HOST = "0.0.0.0"  # listen on every interface, including the hotspot's wlan0
 WEB_PORT = 5000
 
-#----------------EMA Information--------------------
-EMA_FAST_ALPHA = 0.5 #react quickly to change of PWR
-EMA_SLOW_ALPHA = 0.05 #ract slowly
+# --- Sonar trend detection (dual EMA) ---------------------------------------
+EMA_FAST_ALPHA = 0.5    # reacts quickly to recent samples
+EMA_SLOW_ALPHA = 0.05   # slow-moving baseline
+TREND_HYSTERESIS_DB = 1.5  # gap (dB) required before a trend is reported
 
-#for not changing every second between fast and slow, we add a limit
-TREND_HYSTERESIS_DB = 1.5 #change smaller than 1.5 dB are not notified
-
-
-#----------Distance Estimation------------------
+# --- Distance estimation (log-distance path loss model) --------------------
 # d = 10 ^ ((P0 - PWR_filtered) / (10 * n))
-#   P0 = reference RSSI at 1 meter (dBm)
-#   n  = path loss exponent (environment-dependent)
-# These are generic literature averages, NOT calibrated for this hardware/ environment
+# Generic literature values, NOT calibrated for this hardware/environment:
+# treat this as a rough order of magnitude, not a precise measurement.
+# Purely informational -- independent from the trend detection above.
 PATH_LOSS_P0 = -38.0   # dBm at 1m
-PATH_LOSS_N = 3.2      # typical indoor value
+PATH_LOSS_N = 3.2      # typical indoor path loss exponent
 
 RADAR_FIELDNAMES = ['BSSID', 'First_time_seen', 'Last_time_seen', 'channel', 'Speed',
                      'Privacy', 'Cipher', 'Authentication', 'Power', 'beacons', 'IV',
                      'LAN_IP', 'ID_length', 'ESSID', 'Key']
 
-# Matches ASCII control characters (0x00-0x1F minus tab, plus 0x7F) -- notably
-# \r and ESC, which a terminal will happily act on instead of printing.
+# ASCII control chars (0x00-0x1F minus tab, plus 0x7F) -- notably \r and ESC,
+# which a terminal would act on instead of printing.
 CONTROL_CHARS_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 
 
 def sanitize(text):
     """
-    L'ESSID (et les noms de vendor resolus par wlan.*_resolved) viennent
-    directement de donnees radio non fiables : un AP mal forme -- ou
-    deliberement malveillant, dans le contexte d'un outil d'audit -- peut y
-    placer n'importe quel octet, y compris des caracteres de controle
-    (\\r, sequences d'echappement ANSI...). Affiches tels quels dans un
-    terminal, ils peuvent deplacer le curseur ou reecrire la ligne en
-    cours -- symptome typique : l'affichage semble "s'ecraser" a gauche.
-    On neutralise systematiquement ces caracteres des l'ingestion de la
-    donnee, pas seulement au moment de l'affichage.
+    Strip control characters from radio-sourced strings (ESSID, resolved
+    vendor names). A malformed or malicious AP can embed \\r or ANSI escape
+    sequences that would otherwise corrupt the terminal redraw.
     """
     if not text:
         return ""
@@ -125,12 +98,9 @@ def sanitize(text):
 
 def make_run_prefix():
     """
-    Chemin (dossier + prefixe de fichier) unique pour cette execution,
-    horodate. Tous les CSV du radar atterrissent dans RADAR_CSV_DIR/
-    plutot que dans le dossier courant, et l'horodatage dans le nom
-    suffit a garantir qu'une execution ne peut jamais relire le fichier
-    laisse par une execution precedente -- plus besoin de deplacer les
-    vieux fichiers a la main.
+    Unique, timestamped path prefix for this run's radar CSV files, under
+    RADAR_CSV_DIR/. Guarantees a run never reads a previous run's leftover
+    file.
     """
     os.makedirs(RADAR_CSV_DIR, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -153,7 +123,7 @@ def list_wireless_interfaces():
 
 
 def choose_two_interfaces():
-    """Demande a l'operateur de choisir deux interfaces distinctes : radar et cible."""
+    """Ask the operator to pick two distinct interfaces: radar and target."""
     interfaces = list_wireless_interfaces()
     if len(interfaces) < 2:
         print("Il faut au moins 2 interfaces WiFi pour ce script (une radar, une cible).")
@@ -186,7 +156,7 @@ def choose_two_interfaces():
 
 
 def enable_monitor_mode(iface):
-    """Passe une interface en mode monitor via airmon-ng, gere le renommage eventuel."""
+    """Switch an interface to monitor mode via airmon-ng, handling renaming."""
     result = subprocess.run(["sudo", "airmon-ng", "start", iface],
                              stdin=subprocess.DEVNULL, capture_output=True, text=True)
     output = result.stdout + result.stderr
@@ -200,41 +170,45 @@ def enable_monitor_mode(iface):
     return iface
 
 
-def estimate_distance(pwr_filtered) :
+def estimate_distance(pwr_filtered):
     """
-    Convert a filtered RSSI value into an estimated distance in m.
+    Convert a filtered RSSI (dBm) into an estimated distance (m) using the
+    log-distance path loss model (Mazuelas et al., 2009). Informational
+    only.
     """
     if pwr_filtered is None:
         return None
-    return 10**((PATH_LOSS_P0 -pwr_filtered)/(10*PATH_LOSS_N))
-#formule found in "Robust Indoor Positioning Provided by Real-Time RSSI Values in Unmodified WLAN Networks"
+    return 10 ** ((PATH_LOSS_P0 - pwr_filtered) / (10 * PATH_LOSS_N))
 
 
 def compute_trend(ema_fast, ema_slow):
+    """
+    Compare the fast and slow RSSI EMA to flag an approach/retreat trend.
+    A hysteresis band (TREND_HYSTERESIS_DB) absorbs ordinary RF noise so
+    the indicator doesn't flicker.
+    """
     if ema_fast is None or ema_slow is None:
         return None
     delta = ema_fast - ema_slow
-    if delta > TREND_HYSTERESIS_DB :
+    if delta > TREND_HYSTERESIS_DB:
         return "approche"
-    elif delta < TREND_HYSTERESIS_DB :
+    elif delta < -TREND_HYSTERESIS_DB:
         return "eloigne"
     return "stable"
 
+
 # =============================================================================
-# RADAR : lecture synchrone du CSV, appelee depuis la boucle principale
+# RADAR: synchronous CSV polling, called from the main loop
 # =============================================================================
 
 class DiscoveryRadar:
     """
-    Lance un airodump-ng en continu (hopping) et expose poll(), a appeler
-    depuis la boucle principale : relit le CSV et met a jour la liste des
-    reseaux. Pas de thread ni de lock ici -- un seul appelant (le main
-    loop), donc pas besoin de synchronisation.
+    Runs a continuous hopping airodump-ng and exposes poll(), called from
+    the main loop to re-read the CSV and refresh the network list. No
+    thread/lock needed: single caller.
 
-    self._order fixe l'ordre d'affichage de facon STABLE (ordre de
-    premiere apparition) : un reseau garde toujours le meme numero une
-    fois vu, meme si sa puissance -- donc son rang "naturel" -- change
-    d'un tick a l'autre.
+    self._order keeps display order STABLE (first-seen order): a network
+    keeps the same selection number even as its signal-based rank changes.
     """
 
     def __init__(self, iface, csv_prefix):
@@ -252,7 +226,7 @@ class DiscoveryRadar:
         )
 
     def poll(self):
-        """A appeler une fois par tick de la boucle principale."""
+        """Call once per main-loop tick."""
         csv_file = f"{self.csv_prefix}-01.csv"
         if not os.path.exists(csv_file):
             return
@@ -263,7 +237,7 @@ class DiscoveryRadar:
             if row["BSSID"] in (None, "BSSID"):
                 continue
             if row["BSSID"] == "Station MAC":
-                break  # section STATION : le radar ne s'occupe que des APs
+                break  # STATION section: radar only cares about APs
             row = {k: (sanitize(v.strip()) if isinstance(v, str) else v) for k, v in row.items()}
             bssid = row["BSSID"]
             if not bssid:
@@ -275,11 +249,7 @@ class DiscoveryRadar:
         self._purge_stale()
 
     def _purge_stale(self):
-        """
-        Drop any BSSID whose airodump-ng Last_time_seen is older than
-        STALE_TIMEOUT. Called once per poll(), after the CSV re-read, so
-        stale entries never survive more than one tick past their timeout.
-        """
+        """Drop any BSSID whose Last_time_seen is older than STALE_TIMEOUT."""
         now = time.time()
         stale_bssids = []
         for bssid, row in self._networks.items():
@@ -299,7 +269,7 @@ class DiscoveryRadar:
             self._order.remove(bssid)
 
     def get_networks(self):
-        """Liste des reseaux dans l'ordre stable de decouverte (index = numero de selection)."""
+        """Networks in stable discovery order (index = selection number)."""
         return [self._networks[b] for b in self._order]
 
     def stop(self):
@@ -312,50 +282,34 @@ class DiscoveryRadar:
 
 
 # =============================================================================
-# TARGET LISTENER : seul thread de fond du script -- capture live tshark
+# TARGET LISTENER: the script's only background thread -- live tshark capture
 # =============================================================================
 
 class TargetListener:
     """
     Owns interface B. switch_target() locks the radio channel, then (re)starts
-    a live tshark capture (-i, no intermediate pcap file) filtered on a single
-    BSSID. A background thread reads its output line by line as packets
-    arrive -- this is the only place in the script where a thread is truly
-    needed for capture, since packet arrival is asynchronous by nature and
-    cannot be tied to our display refresh cycle without dropping packets in
-    between.
+    a live tshark capture (-i, no intermediate pcap) filtered on one BSSID.
+    A background thread reads its output as packets arrive -- the only place
+    a thread is truly needed, since packet arrival is asynchronous.
 
-    DIRECTION-FINDING MODE (RSSI table)
-    ------------------------------------
-    Instead of only listing client MAC addresses, this class builds a
-    unified "stations" table that includes BOTH the access point and every
-    client talking to it, each with a live RSSI reading. This is the data
-    source for the manual direction-finding workflow: walk around / rotate
-    the antenna, watch the RSSI of the station you're trying to locate, and
-    move towards higher values.
+    Builds a unified "stations" table (AP + every client talking to it),
+    each with a live RSSI reading, used for manual direction finding and
+    the sonar trend/distance indicators.
 
-    How AP vs client is determined (no separate lookup, just an addressing
-    rule applied to each captured frame):
-      - Beacon frames are sent by the AP; if the source address (wlan.sa)
-        equals the BSSID we're filtering on, the transmitter of this frame
-        is the AP itself.
-      - Data frames are exchanged between the AP and a client. If the BSSID
-        appears as the destination (wlan.da), then the source (wlan.sa) is
-        a client sending to the AP (uplink).
+    AP vs client, determined per captured frame (no separate lookup):
+      - Beacon frames: source (wlan.sa) == BSSID -> that's the AP.
+      - Data frames: BSSID as destination (wlan.da) -> source (wlan.sa)
+        is a client sending to the AP (uplink).
 
-    Where the RSSI comes from: the radiotap header field `dbm_antsignal`,
-    which is metadata ADDED BY OUR OWN WIFI ADAPTER at capture time -- it is
-    not part of the 802.11 protocol itself. It reflects the signal strength
-    of that specific frame as received by OUR antenna, regardless of who
-    transmitted it.
+    RSSI source: radiotap's `dbm_antsignal`, added by OUR OWN adapter at
+    capture time -- signal strength of that
+    frame as seen by our antenna, regardless of who transmitted it.
 
-    Entries are never removed from the stations table (no timeout-based
-    eviction). Instead we track `last_seen` per station so the UI can show
-    an "age" column -- purely informational.
+    Stations are never evicted (no timeout); `last_seen` just feeds an
+    informational "age" column.
     """
 
-    # Field order matters: it must match the order of "-e" flags in the
-    # tshark command built in switch_target().
+    # Field order must match the "-e" flags built in switch_target().
     FIELDS = ["wlan.bssid", "wlan.sa", "wlan.da", "wlan.sa_resolved", "wlan.da_resolved",
               "radiotap.dbm_antsignal"]
 
@@ -365,17 +319,9 @@ class TargetListener:
         self.current_essid = None
         self.current_channel = None
 
-        # Unified table: MAC address -> station info dict, for BOTH the AP
-        # and its clients.
-        #
-        # station info dict layout:
-        #   "role"      : "AP" or "CLIENT"
-        #   "vendor"    : resolved vendor string (best-effort, may be empty)
-        #   "pwr"       : most recent instantaneous RSSI in dBm (int) or None
-        #   "history"   : deque of the last RSSI_HISTORY_LEN RSSI samples,
-        #                 used to compute the moving average
-        #   "last_seen" : time.time() timestamp of the last frame that
-        #                 updated this entry
+        # mac -> station dict: role ("AP"/"CLIENT"), vendor, pwr (latest
+        # RSSI), history (deque for the SMA), ema_fast/ema_slow (sonar
+        # trend + distance inputs), last_seen.
         self._stations = {}
         self._lock = threading.Lock()
 
@@ -409,9 +355,13 @@ class TargetListener:
 
     def _update_station(self, mac, role, vendor, rssi):
         """
-        Create or refresh one station's entry. Called with the lock already
-        NOT held -- this method acquires it itself, since it's called from
-        multiple points in _read_loop.
+        Create or refresh one station's entry. Acquires the lock itself
+        (called from multiple points in _read_loop).
+
+        ema_fast/ema_slow are recursive (depend on previous state), unlike
+        the SMA `history`, so they're updated here on arrival rather than
+        recomputed at snapshot time. Both are bootstrapped to the first
+        RSSI sample seen.
         """
         now = time.time()
         with self._lock:
@@ -423,7 +373,7 @@ class TargetListener:
                     "pwr": None,
                     "history": deque(maxlen=RSSI_HISTORY_LEN),
                     "ema_slow": None,
-                    "ema_fast": None, #for the trend comparison and distance estimate
+                    "ema_fast": None,
                     "last_seen": now,
                 }
                 self._stations[mac] = entry
@@ -440,8 +390,8 @@ class TargetListener:
                     entry["ema_slow"] = float(rssi)
                     entry["ema_fast"] = float(rssi)
                 else:
-                    entry["ema_slow"] = EMA_SLOW_ALPHA * rssi + (1-EMA_SLOW_ALPHA) * entry["ema_slow"]
-                    entry["ema_fast"] = EMA_FAST_ALPHA * rssi + (1-EMA_FAST_ALPHA) * entry["ema_fast"]
+                    entry["ema_slow"] = EMA_SLOW_ALPHA * rssi + (1 - EMA_SLOW_ALPHA) * entry["ema_slow"]
+                    entry["ema_fast"] = EMA_FAST_ALPHA * rssi + (1 - EMA_FAST_ALPHA) * entry["ema_fast"]
 
     def _read_loop(self):
         for line in self._proc.stdout:
@@ -466,10 +416,9 @@ class TargetListener:
 
     def get_stations(self):
         """
-        Returns a plain-dict snapshot of the stations table, safe to read
-        without holding the lock afterwards. Moving average is computed
-        here rather than stored, since it's cheap and only needed at
-        render/snapshot time.
+        Plain-dict snapshot of the stations table, safe to read without
+        the lock afterwards. The SMA is computed here (cheap, stateless);
+        ema_fast/ema_slow are returned as already-stored values.
         """
         with self._lock:
             snapshot = {}
@@ -503,33 +452,24 @@ class TargetListener:
 
 
 # =============================================================================
-# SNAPSHOT : seule fonction qui calcule les donnees a afficher (une fois par
-# tick), consommee ensuite par render_terminal() ET par le serveur web.
+# SNAPSHOT: the single function computing display data once per tick,
+# consumed by both render_terminal() and the web server.
 # =============================================================================
 
 def build_snapshot(networks, listener):
     """
-    Computes everything the UI needs to show, as a plain JSON-serializable
-    dict, from the raw radar network list and the current TargetListener
-    state. This is the SINGLE place where ages are computed, stations are
-    sorted, and numbers are rounded for display -- both render_terminal()
-    (ANSI text) and the Flask SSE endpoint (JSON) consume this same dict
-    without recomputing anything themselves.
+    Build the JSON-serializable dict the UI needs, from the raw radar
+    network list and the current TargetListener state. This is the only
+    place ages are computed, stations sorted, and numbers rounded.
 
-    Shape of the returned dict:
+    Shape:
     {
-        "networks": [
-            {"index": 0, "bssid": "...", "channel": "6", "pwr": "-45",
-             "age": 3, "essid": "MyWifi", "privacy": "WPA2"},
-            ...
-        ],
-        "listening": {"essid": "...", "bssid": "...", "channel": 6} or None,
-        "stations": [
-            {"mac": "...", "role": "AP", "pwr": -40, "avg": -41.2,
-             "age": 1, "vendor": "TP-Link"},
-            ...
-        ]
+        "networks": [{"index", "bssid", "channel", "pwr", "age", "essid", "privacy"}, ...],
+        "listening": {"essid", "bssid", "channel"} or None,
+        "stations": [{"mac", "role", "pwr", "avg", "distance_m", "trend",
+                       "age", "vendor"}, ...]
     }
+    distance_m and trend are computed independently from ema_slow/ema_fast.
     """
     now = time.time()
 
@@ -588,7 +528,7 @@ def build_snapshot(networks, listener):
 
 
 # =============================================================================
-# AFFICHAGE TERMINAL : formate le snapshot en texte ANSI
+# TERMINAL RENDERING: formats the snapshot as ANSI text
 # =============================================================================
 
 def render_terminal(snapshot):
@@ -632,17 +572,15 @@ def render_terminal(snapshot):
 
 
 # =============================================================================
-# SERVEUR WEB : Flask + Server-Sent Events, tourne dans son propre thread
+# WEB SERVER: Flask + Server-Sent Events, in its own background thread
 # =============================================================================
 
 class WebState:
     """
     Thread-safe holder for the latest snapshot. The main loop calls
-    set_snapshot() once per tick, right after computing it with
-    build_snapshot(). The Flask SSE endpoint (running in its own thread)
-    calls get_snapshot() on its own timer to push updates to connected
-    browsers. No history, no diffing -- just "what's the current full
-    picture", refreshed wholesale each tick.
+    set_snapshot() once per tick; the SSE endpoint calls get_snapshot() on
+    its own timer to push updates. No history, no diffing -- just the
+    current full picture, refreshed wholesale each tick.
     """
 
     def __init__(self):
@@ -659,9 +597,8 @@ class WebState:
 
 
 # Minimal single-page dashboard. No external JS/CSS libraries (the hotspot
-# has no internet access) -- just vanilla JS using the browser's built-in
-# EventSource API to receive SSE pushes, and plain HTML tables re-rendered
-# on every message.
+# has no internet access): vanilla JS with the browser's built-in
+# EventSource API, plain HTML tables re-rendered on every message.
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="fr">
@@ -754,20 +691,14 @@ DASHBOARD_HTML = """
 
 def create_web_app(web_state):
     """
-    Builds the Flask app with exactly two routes:
-      GET /        -> the HTML page above (loaded once by the browser)
-      GET /stream  -> the SSE endpoint (stays open, keeps pushing updates)
-    Kept as a factory function (rather than a module-level `app = Flask(...)`)
-    so that web_state -- created in main() -- can be captured by closures
-    without relying on a global variable.
+    Flask app with two routes: GET / (dashboard page) and GET /stream
+    (the SSE endpoint). Kept as a factory so web_state -- created in
+    main()
     """
     app = Flask(__name__)
 
-    # Flask/Werkzeug logs one line per HTTP request by default. Since /stream
-    # stays open and is polled internally, and since our terminal UI clears
-    # and redraws the screen every tick with raw ANSI codes, any stray log
-    # line printed to stdout by Flask would visually corrupt that redraw.
-    # Silencing it here keeps the terminal display clean.
+    # Silence Werkzeug's per-request logging: it would otherwise print to
+    # stdout and corrupt the terminal's ANSI redraw.
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
     @app.route("/")
@@ -779,9 +710,8 @@ def create_web_app(web_state):
         def event_stream():
             while True:
                 snapshot = web_state.get_snapshot()
-                # SSE wire format: "data: <payload>\n\n" -- the blank line
-                # is what tells the browser's EventSource "this message is
-                # complete, deliver it now".
+                # SSE format: "data: <payload>\n\n" -- the blank line marks
+                # the message as complete.
                 yield f"data: {json.dumps(snapshot)}\n\n"
                 time.sleep(REFRESH_INTERVAL)
 
@@ -790,7 +720,7 @@ def create_web_app(web_state):
             mimetype="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",  # prevents any reverse proxy from buffering the stream
+                "X-Accel-Buffering": "no",  # prevent reverse-proxy buffering
             },
         )
 
@@ -799,13 +729,9 @@ def create_web_app(web_state):
 
 def start_web_server(web_state):
     """
-    Starts the Flask app in a daemon background thread. threaded=True lets
-    Flask's development server handle more than one open /stream connection
-    at a time (e.g. two phones watching the dashboard simultaneously)
-    without one blocking the other. use_reloader=False is required: Flask's
-    auto-reloader tries to run in the main thread and re-exec the process,
-    which doesn't make sense here since we're already inside a background
-    thread of a larger script.
+    Run the Flask app in a daemon background thread. threaded=True allows
+    multiple simultaneous /stream connections. use_reloader=False is
+    required since we're already inside a background thread.
     """
     app = create_web_app(web_state)
 
@@ -840,9 +766,8 @@ def main():
     listener = TargetListener(target_iface)
     radar.start()
 
-    # The web server is started once, before the main loop, and lives for
-    # the whole run: it doesn't need to know about interfaces or targets,
-    # it only ever reads whatever build_snapshot() last produced.
+    # Started once, before the main loop; lives for the whole run and only
+    # ever reads whatever build_snapshot() last produced.
     web_state = WebState()
     start_web_server(web_state)
     print(f"Dashboard web disponible sur http://192.168.4.1:{WEB_PORT}/")
@@ -852,10 +777,9 @@ def main():
             radar.poll()
             networks = radar.get_networks()
 
-            # select() attend au plus REFRESH_INTERVAL secondes une entree
-            # clavier -- remplace un thread+queue dedies a la saisie tout
-            # en reagissant plus vite qu'un sleep() fixe si l'operateur
-            # tape quelque chose avant la fin du tick.
+            # select() waits up to REFRESH_INTERVAL seconds for keyboard
+            # input -- avoids a dedicated thread+queue while reacting
+            # faster than a fixed sleep() if the operator types early.
             ready, _, _ = select.select([sys.stdin], [], [], REFRESH_INTERVAL)
             if ready:
                 raw = sys.stdin.readline().strip()
@@ -875,9 +799,8 @@ def main():
         print("\nArret en cours...")
         radar.stop()
         listener.stop()
-        # Filet de securite : si un sous-processus a quand meme laisse le
-        # terminal dans un etat casse (raw mode, no-echo...), on le remet
-        # dans un etat "sain" avant de rendre la main.
+        # Safety net: reset the terminal in case a subprocess left it in a
+        # broken state (raw mode, no echo...).
         subprocess.run(["stty", "sane"])
         print("Pense a repasser les interfaces en mode managed :")
         print(f"  sudo airmon-ng stop {radar_iface}")
