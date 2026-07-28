@@ -144,7 +144,7 @@ class BleCapture:
          device_name, company_id, manuf_data, uuid16) = fields
 
         if not adv_addr:
-            # No advertising address on this PDU (e.g. some control PDUs) - not useful for the radar
+            # No advertising address on this PDU (some control PDUs) - not useful for the radar
             return None
 
         pdu_type_int = _parse_int(pdu_type)
