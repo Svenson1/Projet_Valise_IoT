@@ -8,7 +8,7 @@ RSSI model as the WiFi sonar to tell approaching/receding devices apart.
 import time
 from manuf import manuf
 
-_oui_parser = manuf.MacParser()
+_oui_parser = manuf.MacParser(manuf_name="./manuf_db")
 
 # --- Sonar / distance constants, consistent with the WiFi RSSI model ---
 RSSI_REF = -38.0            # RSSI at 1 meter (path-loss reference, literature value)
