@@ -31,6 +31,8 @@ RF_CHANNEL_TO_ADV_CHANNEL = {0: 37, 12: 38, 39: 39}
 TSHARK_FIELDS = [
     "frame.time_epoch",
     "btle.advertising_address",
+    "btle.scanning_address",     # real sender for SCAN_REQ (ScanA)
+    "btle.initiator_address",    # real sender for CONNECT_IND (InitA)
     "btle_rf.signal_dbm",
     "btle_rf.channel",
     "btle.advertising_header.pdu_type",
@@ -51,6 +53,11 @@ PDU_TYPE_NAMES = {
     6: "ADV_SCAN_IND",
     7: "ADV_EXT_IND",
 }
+
+# For these two PDU types, btle.advertising_address holds the TARGET's
+# address, not the address of whoever actually transmitted the frame.
+PDU_SCAN_REQ = 3
+PDU_CONNECT_IND = 5
 
 
 def dict_to_object(d):
@@ -140,8 +147,8 @@ class BleCapture:
         if len(fields) != len(TSHARK_FIELDS):
             return None
 
-        (time_epoch, adv_addr, rssi, rf_channel, pdu_type,
-         device_name, company_id, manuf_data, uuid16) = fields
+        (time_epoch, adv_addr, scan_addr, init_addr, rssi, rf_channel,
+         pdu_type, device_name, company_id, manuf_data, uuid16) = fields
 
         if not adv_addr:
             # No advertising address on this PDU (some control PDUs) - not useful for the radar
@@ -149,9 +156,28 @@ class BleCapture:
 
         pdu_type_int = _parse_int(pdu_type)
 
+        # Resolve the address of whoever actually emitted this specific
+        # frame - the RSSI we measured belongs to that device, not
+        # necessarily to whatever "advertising_address" says. For
+        # SCAN_REQ/CONNECT_IND, advertising_address is the TARGET, and the
+        # real sender is in a separate field.
+        if pdu_type_int == PDU_SCAN_REQ:
+            sender_addr = scan_addr or None
+        elif pdu_type_int == PDU_CONNECT_IND:
+            sender_addr = init_addr or None
+        else:
+            sender_addr = adv_addr or None
+
+        if not sender_addr:
+            # No usable address for this frame - could be a control PDU,
+            # or a SCAN_REQ/CONNECT_IND whose real sender field failed to
+            # dissect. Drop it rather than risk attributing its RSSI to
+            # the wrong device.
+            return None
+
         packet = {
             "time": float(time_epoch) if time_epoch else None,
-            "advAddress": adv_addr.lower(),
+            "advAddress": sender_addr.lower(),
             "RSSI": _parse_int(rssi),
             "channel": RF_CHANNEL_TO_ADV_CHANNEL.get(_parse_int(rf_channel)),
             "pduType": pdu_type_int,
