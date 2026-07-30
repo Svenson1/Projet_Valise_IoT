@@ -14,7 +14,7 @@ from queue import Empty
 from ble_capture import BleCapture
 from ble_radar import BleRadar
 
-REFRESH_INTERVAL_S = 0.5
+REFRESH_INTERVAL_S = 2.5
 CLEAR_SCREEN = "\x1b[2J\x1b[H"   # ANSI clear
 
 
