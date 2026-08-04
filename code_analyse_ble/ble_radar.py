@@ -61,7 +61,7 @@ class TrackedDevice:
         self.ema_slow = None
 
     def update(self, packet):
-        self.last_seen = packet.time or time.time()
+        self.last_seen = time.time()
         self.seen_count += 1
         self.last_channel = packet.channel
         self.last_pdu_type = packet.pduTypeName

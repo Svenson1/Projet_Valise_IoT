@@ -15,6 +15,10 @@ from ble_radar import BleRadar
 REFRESH_INTERVAL_S = 2.5
 CLEAR_SCREEN = "\x1b[2J\x1b[H"   # ANSI clear
 
+# Devices weaker than this are hidden from display (still tracked
+# internally in ble_radar.py, just not shown). Set to None to disable.
+MIN_RSSI_DBM = -85
+
 
 def render(snapshot):
     lines = [CLEAR_SCREEN]
@@ -23,6 +27,9 @@ def render(snapshot):
         f"{'Address':<20}{'Label':<24}{'RSSI':>7}{'Dist(m)':>9}"
         f"{'Trend':>10}{'PDU':>16}{'Seen':>7}{'Ch':>5}{'Age(s)':>8}"
     )
+
+    if MIN_RSSI_DBM is not None:
+        snapshot = [d for d in snapshot if d["rssi"] is not None and d["rssi"] >= MIN_RSSI_DBM]
 
     if not snapshot:
         lines.append("(aucun device detecte pour le moment)")
