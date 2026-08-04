@@ -1,13 +1,15 @@
 """
-BLE advertising capture layer for the nRF52840-DK
+BLE advertising capture layer for the nRF52840-DK boussole receiver.
 
 Pipeline:
     nrfutil ble-sniffer sniff --output-pcap-file <FIFO> -> writes a live
-        PCAP stream into a named pipe. Single radio hopping 37/38/39 sequentially).
+        PCAP stream into a named pipe. Single radio hopping 37/38/39
+        sequentially (not simultaneous like the WCH Analyzer Pro).
     tshark -r <FIFO>       -> reads that PCAP stream from the same FIFO.
 """
 
 import os
+import signal
 import tempfile
 import subprocess
 import shutil
@@ -16,8 +18,7 @@ from queue import Queue
 from types import SimpleNamespace
 
 
-# Serial port the nRF52840-DK enumerates as on the Pi (the "nRF USB" port,
-# not the debug/J-Link port). Override via BleCapture(port=...) if it differs
+# Serial port the nRF52840-DK enumerates as on the Pi
 DEFAULT_NRF_PORT = "/dev/ttyACM0"
 
 TSHARK_FIELDS = [
@@ -97,7 +98,7 @@ class BleCapture:
         # Start tshark first: opening a FIFO for reading blocks until a
         # writer connects, so this just sits ready. nrfutil's own file
         # write on the same FIFO then completes the pairing and both
-        # processes proceed - same rendezvous pattern as wch_capture.
+        # processes proceed - same  pattern as wch_capture.
         self._tshark_proc = subprocess.Popen(
             [
                 "tshark",
@@ -124,6 +125,7 @@ class BleCapture:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            start_new_session=True,
         )
 
         self._reader_thread = Thread(target=self._read_output, daemon=True)
@@ -173,15 +175,32 @@ class BleCapture:
         return dict_to_object(packet)
 
     def stop_capture(self):
-        for proc in (self._tshark_proc, self._nrf_proc):
-            if proc is not None and proc.poll() is None:
-                proc.terminate()
+        if self._tshark_proc is not None and self._tshark_proc.poll() is None:
+            self._tshark_proc.terminate()
+
+        # nrf_proc was started in its own process group (start_new_session
+        # =True), so killpg reaches both the wrapper and its
+        # nrfutil-ble-sniffer child
+        if self._nrf_proc is not None and self._nrf_proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(self._nrf_proc.pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
         for proc in (self._tshark_proc, self._nrf_proc):
             if proc is not None:
                 try:
                     proc.wait(timeout=2)
                 except subprocess.TimeoutExpired:
-                    proc.kill()
+                    pass
+
+        # Fallback: if SIGTERM wasn't enough, force
+        # kill whatever is left in that process group.
+        if self._nrf_proc is not None and self._nrf_proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(self._nrf_proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         if self._reader_thread is not None:
             self._reader_thread.join(timeout=2)
         if self._fifo_path and os.path.exists(self._fifo_path):
