@@ -9,7 +9,7 @@ Analyse un ou plusieurs fichiers .pcap issus d'une capture airodump-ng
 
 Peut etre utilise de deux facons :
   - en ligne de commande, sur des pcap deja existants
-  - importe comme module par wifi_audit_v3.py, pour enchainer
+  - importe comme module par audit_wifi_auto, pour enchainer
     automatiquement l'analyse juste apres la capture (phase 2 du pipeline)
 
 Usage (ligne de commande):

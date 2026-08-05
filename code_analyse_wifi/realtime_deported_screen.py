@@ -26,9 +26,6 @@ via Server-Sent Events.
 
 Sonar feature: a dual-EMA RSSI trend detector (approaching / moving away
 / stable) plus an informational distance estimate.
-
-Usage:
-    sudo python3 wifi_realtime.py
 """
 
 import subprocess

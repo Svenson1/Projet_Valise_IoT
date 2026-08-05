@@ -435,7 +435,6 @@ Wireshark/tshark, then rename it to `.pcap` purely for naming clarity (no
 functional difference -- aircrack-ng's .cap IS the pcap format).
 """
 
-
 # =============================================================================
 # PHASE 2 (AUTOMATIC): ANALYZE THE CAPTURES AND BUILD THE REPORT
 # =============================================================================
