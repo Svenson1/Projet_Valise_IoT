@@ -81,7 +81,7 @@ timestamped backup/ folder instead of deleting them, so nothing is lost.
 
 
 wlan_pattern = re.compile("wlan[0-9]+")
-check_wifi_result = wlan_pattern.findall(subprocess.run(["iwconfig"], capture_output=True).stdout.decode())
+check_wifi_result = wlan_pattern.findall(subprocess.run(["iconfig"], capture_output=True).stdout.decode())
 
 if len(check_wifi_result) == 0:
     print("No WiFi adapter found. Please attach one and retry.")
