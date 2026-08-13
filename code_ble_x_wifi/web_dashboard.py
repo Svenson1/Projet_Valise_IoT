@@ -67,6 +67,9 @@ DASHBOARD_HTML = """
     table { border-collapse: collapse; width: 100%; margin-bottom: 1.5em; }
     th, td { border: 1px solid #444; padding: 4px 8px; text-align: left; font-size: 14px; }
     th { background: #222; }
+    th.sortable { cursor: pointer; user-select: none; position: relative; }
+    th.sortable:hover { background: #2a2a2a; }
+    th .arrow { margin-left: 6px; font-size: 0.8em; color: #7fd; }
     tr.ap { color: #ffd27f; font-weight: bold; }
     #listening { margin-bottom: 1em; color: #7fd; }
     .trend-approche { color: #7fff7f; font-weight: bold; }
@@ -82,7 +85,16 @@ DASHBOARD_HTML = """
 <body>
   <h2>WiFi - Radar</h2>
   <table id="networks">
-    <thead><tr><th>No</th><th>BSSID</th><th>CH</th><th>PWR</th><th>AGE</th><th>ESSID</th><th>Chiffrement</th><th></th></tr></thead>
+    <thead><tr>
+      <th class="sortable" data-key="index" data-type="number">No<span class="arrow"></span></th>
+      <th class="sortable" data-key="bssid" data-type="string">BSSID<span class="arrow"></span></th>
+      <th class="sortable" data-key="channel" data-type="number">CH<span class="arrow"></span></th>
+      <th class="sortable" data-key="pwr" data-type="number">PWR<span class="arrow"></span></th>
+      <th class="sortable" data-key="age" data-type="number">AGE<span class="arrow"></span></th>
+      <th class="sortable" data-key="essid" data-type="string">ESSID<span class="arrow"></span></th>
+      <th class="sortable" data-key="privacy" data-type="string">Chiffrement<span class="arrow"></span></th>
+      <th></th>
+    </tr></thead>
     <tbody></tbody>
   </table>
 
@@ -90,13 +102,32 @@ DASHBOARD_HTML = """
 
   <h2>WiFi - Stations (AP + clients)</h2>
   <table id="stations">
-    <thead><tr><th>MAC</th><th>Role</th><th>PWR</th><th>AVG</th><th>Distance</th><th>Tendance</th><th>AGE</th><th>Vendor</th></tr></thead>
+    <thead><tr>
+      <th class="sortable" data-key="mac" data-type="string">MAC<span class="arrow"></span></th>
+      <th class="sortable" data-key="role" data-type="string">Role<span class="arrow"></span></th>
+      <th class="sortable" data-key="pwr" data-type="number">PWR<span class="arrow"></span></th>
+      <th class="sortable" data-key="avg" data-type="number">AVG<span class="arrow"></span></th>
+      <th class="sortable" data-key="distance_m" data-type="number">Distance<span class="arrow"></span></th>
+      <th class="sortable" data-key="trend" data-type="string">Tendance<span class="arrow"></span></th>
+      <th class="sortable" data-key="age" data-type="number">AGE<span class="arrow"></span></th>
+      <th class="sortable" data-key="vendor" data-type="string">Vendor<span class="arrow"></span></th>
+    </tr></thead>
     <tbody></tbody>
   </table>
 
   <h2>BLE - Appareils detectes</h2>
   <table id="ble-devices">
-    <thead><tr><th>Adresse</th><th>Label</th><th>RSSI</th><th>Distance</th><th>Tendance</th><th>PDU</th><th>Ch</th><th>Vus</th><th>AGE</th></tr></thead>
+    <thead><tr>
+      <th class="sortable" data-key="address" data-type="string">Adresse<span class="arrow"></span></th>
+      <th class="sortable" data-key="label" data-type="string">Label<span class="arrow"></span></th>
+      <th class="sortable" data-key="rssi" data-type="number">RSSI<span class="arrow"></span></th>
+      <th class="sortable" data-key="distance_m" data-type="number">Distance<span class="arrow"></span></th>
+      <th class="sortable" data-key="trend" data-type="string">Tendance<span class="arrow"></span></th>
+      <th class="sortable" data-key="pdu_type" data-type="string">PDU<span class="arrow"></span></th>
+      <th class="sortable" data-key="last_channel" data-type="number">Ch<span class="arrow"></span></th>
+      <th class="sortable" data-key="seen_count" data-type="number">Vus<span class="arrow"></span></th>
+      <th class="sortable" data-key="age_s" data-type="number">AGE<span class="arrow"></span></th>
+    </tr></thead>
     <tbody></tbody>
   </table>
 
@@ -108,8 +139,90 @@ DASHBOARD_HTML = """
     const wifiSource = new EventSource('/stream/wifi');
     const bleSource = new EventSource('/stream/ble');
 
+    // ---- Tri par colonne (3 etats) ------------------------------------
+    // On garde en memoire le dernier snapshot recu pour chaque tableau,
+    // ainsi que l'etat de tri courant (colonne + etat 0/1/2). Comme le
+    // flux SSE renvoie systematiquement la liste "fraiche" (etat 0 =
+    // ordre serveur), on n'a pas besoin de sauvegarder un ordre initial
+    // separement : il suffit de retrier lastData a chaque clic.
+    const sortState = {
+      networks: { key: null, state: 0 },
+      stations: { key: null, state: 0 },
+      'ble-devices': { key: null, state: 0 },
+    };
+    const lastData = {
+      networks: [],
+      stations: [],
+      'ble-devices': [],
+    };
+
+    function applySort(tableId, rows) {
+      const st = sortState[tableId];
+      if (!st.key || st.state === 0) return rows;
+
+      const header = document.querySelector(`#${tableId} th[data-key="${st.key}"]`);
+      const type = header ? header.dataset.type : 'string';
+
+      const sorted = rows.slice().sort((a, b) => {
+        let valA = a[st.key];
+        let valB = b[st.key];
+
+        // Valeurs manquantes (null/undefined) toujours en fin, peu importe le sens
+        if (valA == null && valB == null) return 0;
+        if (valA == null) return 1;
+        if (valB == null) return -1;
+
+        if (type === 'number') {
+          valA = parseFloat(valA);
+          valB = parseFloat(valB);
+        } else {
+          valA = String(valA).toLowerCase();
+          valB = String(valB).toLowerCase();
+        }
+
+        if (valA < valB) return st.state === 1 ? -1 : 1;
+        if (valA > valB) return st.state === 1 ? 1 : -1;
+        return 0;
+      });
+      return sorted;
+    }
+
+    function updateArrows(tableId) {
+      const st = sortState[tableId];
+      document.querySelectorAll(`#${tableId} th.sortable`).forEach(h => {
+        const arrow = h.querySelector('.arrow');
+        if (h.dataset.key === st.key && st.state !== 0) {
+          arrow.textContent = st.state === 1 ? '▲' : '▼';
+        } else {
+          arrow.textContent = '';
+        }
+      });
+    }
+
+    function setupSortableHeaders(tableId, renderFn) {
+      document.querySelectorAll(`#${tableId} th.sortable`).forEach(header => {
+        header.addEventListener('click', () => {
+          const key = header.dataset.key;
+          const st = sortState[tableId];
+
+          if (st.key !== key) {
+            // Nouvelle colonne cliquee : on repart de zero sur elle
+            st.key = key;
+            st.state = 0;
+          }
+          st.state = (st.state + 1) % 3; // 0 -> 1 -> 2 -> 0
+
+          updateArrows(tableId);
+          renderFn(lastData[tableId]);
+        });
+      });
+    }
+    // ---------------------------------------------------------------
+
     wifiSource.onmessage = function(event) {
       const snap = JSON.parse(event.data);
+      lastData.networks = snap.networks;
+      lastData.stations = snap.stations;
       renderNetworks(snap.networks);
       renderListening(snap.listening);
       renderStations(snap.stations);
@@ -117,6 +230,7 @@ DASHBOARD_HTML = """
 
     bleSource.onmessage = function(event) {
       const devices = JSON.parse(event.data);
+      lastData['ble-devices'] = devices;
       renderBleDevices(devices);
     };
 
@@ -131,7 +245,7 @@ DASHBOARD_HTML = """
     function renderNetworks(networks) {
       const tbody = document.querySelector('#networks tbody');
       tbody.innerHTML = '';
-      for (const net of networks) {
+      for (const net of applySort('networks', networks)) {
         const row = document.createElement('tr');
         const btn = document.createElement('button');
         btn.className = 'target-btn';
@@ -160,7 +274,7 @@ DASHBOARD_HTML = """
     function renderStations(stations) {
       const tbody = document.querySelector('#stations tbody');
       tbody.innerHTML = '';
-      for (const st of stations) {
+      for (const st of applySort('stations', stations)) {
         const row = document.createElement('tr');
         if (st.role === 'AP') row.classList.add('ap');
         const distStr = st.distance_m != null ? `${st.distance_m}m` : '?';
@@ -176,7 +290,7 @@ DASHBOARD_HTML = """
     function renderBleDevices(devices) {
       const tbody = document.querySelector('#ble-devices tbody');
       tbody.innerHTML = '';
-      for (const dev of devices) {
+      for (const dev of applySort('ble-devices', devices)) {
         const row = document.createElement('tr');
         const distStr = dev.distance_m != null ? `${dev.distance_m}m` : '?';
         const trendStr = dev.trend || '?';
@@ -188,6 +302,11 @@ DASHBOARD_HTML = """
         tbody.appendChild(row);
       }
     }
+
+    // Attacher les ecouteurs de clic une fois le DOM pret
+    setupSortableHeaders('networks', renderNetworks);
+    setupSortableHeaders('stations', renderStations);
+    setupSortableHeaders('ble-devices', renderBleDevices);
   </script>
 </body>
 </html>
