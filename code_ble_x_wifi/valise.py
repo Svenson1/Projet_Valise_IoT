@@ -41,6 +41,7 @@ import wifi_radar
 from wifi_radar import DiscoveryRadar, TargetListener
 from ble_capture import BleCapture
 from ble_radar import BleRadar
+from hackrf_capture import HackRfCapture
 from web_dashboard import WebState, start_web_server, WEB_PORT
 
 REFRESH_INTERVAL =2.0     # how often each radar publishes a fresh snapshot
@@ -79,6 +80,12 @@ def ble_bg_loop(ble_capture, ble_radar_obj, ble_state, stop_event):
         if now - last_publish >= REFRESH_INTERVAL:
             ble_state.set_snapshot(ble_radar_obj.build_snapshot())
             last_publish = now
+
+def hackrf_bg_loop(hackrf_capture, hackrf_state, stop_event):
+    while not stop_event.is_set():
+        snapshot = hackrf_capture.build_snapshot()
+        hackrf_state.set_snapshot(snapshot)
+        stop_event.wait(REFRESH_INTERVAL)
 
 
 # =============================================================================
@@ -175,18 +182,32 @@ def main():
     ble_radar_obj = BleRadar()
     ble_capture.start_capture()
 
+    # --- HackRF setup -----------------------------------------------------------
+    hackrf_capture = HackRfCapture()
+    hackrf_capture.start_capture()
+
     # --- Shared state + background threads ------------------------------
+    modules = {}
     wifi_state = WebState(empty_value={"networks": [], "listening": None, "stations": []})
     ble_state = WebState(empty_value=[])
+    hackrf_state = WebState(empty_value={"values_x": [], "values_y": [], "values_max": []})
+
+    modules = {
+        "wifi_state": wifi_state,
+        "ble_state": ble_state,
+        "hackrf_state": hackrf_state,
+    }
 
     stop_event = threading.Event()
     wifi_thread = threading.Thread(target=wifi_bg_loop, args=(radar, listener, wifi_state, stop_event), daemon=True)
     ble_thread = threading.Thread(target=ble_bg_loop, args=(ble_capture, ble_radar_obj, ble_state, stop_event), daemon=True)
+    hackrf_thread = threading.Thread(target=hackrf_bg_loop, args=(hackrf_capture, hackrf_state, stop_event), daemon=True)
     wifi_thread.start()
     ble_thread.start()
+    hackrf_thread.start()
 
     # --- Web dashboard -----------------------------------------------------
-    start_web_server(wifi_state, ble_state, listener)
+    start_web_server(modules, listener)
     print(f"Dashboard web disponible sur http://192.168.4.1:{WEB_PORT}/")
     print("Affichage terminal (debug) actif -- 'q' + Entree pour quitter.\n")
     time.sleep(1)  # let the first snapshots land before the first redraw
@@ -195,7 +216,7 @@ def main():
         while True:
             wifi_snapshot = wifi_state.get_snapshot()
             ble_snapshot = ble_state.get_snapshot()
-            render_terminal(wifi_snapshot, ble_snapshot)
+            # render_terminal(wifi_snapshot, ble_snapshot)
 
             # select() waits up to TERMINAL_TICK seconds for keyboard input.
             # Network numbers are resolved against the snapshot currently on
@@ -219,6 +240,7 @@ def main():
         radar.stop()
         listener.stop()
         ble_capture.stop_capture()
+        hackrf_capture.stop_capture()
         wifi_thread.join(timeout=2)
         ble_thread.join(timeout=2)
         # Safety net: reset the terminal in case a subprocess left it in a

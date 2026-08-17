@@ -59,9 +59,13 @@ with open("dashboard.html", "r", encoding="utf-8") as f:
     DASHBOARD_HTML = f.read()
 
 
-def create_web_app(wifi_state, ble_state, listener):
+def create_web_app(modules, listener):
     """
     Flask app factory.
+
+    modules : list of WebStates
+    modules contains the states that will themselves contain the snapshot 
+    of values needed too be displayed
 
     wifi_state / ble_state: WebState instances holding the latest
     snapshot of each radar, kept up to date by the background threads in
@@ -99,7 +103,7 @@ def create_web_app(wifi_state, ble_state, listener):
     def stream_wifi():
         def event_stream():
             while True:
-                snapshot = wifi_state.get_snapshot()
+                snapshot = modules["wifi_state"].get_snapshot()
                 yield f"data: {json.dumps(snapshot)}\n\n"
                 time.sleep(STREAM_INTERVAL)
 
@@ -113,7 +117,21 @@ def create_web_app(wifi_state, ble_state, listener):
     def stream_ble():
         def event_stream():
             while True:
-                snapshot = ble_state.get_snapshot()
+                snapshot = modules["ble_state"].get_snapshot()
+                yield f"data: {json.dumps(snapshot)}\n\n"
+                time.sleep(STREAM_INTERVAL)
+
+        return Response(
+            event_stream(),
+            mimetype="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.route("/stream/hackrf")
+    def stream_hackrf():
+        def event_stream():
+            while True:
+                snapshot = modules["hackrf_state"].get_snapshot()
                 yield f"data: {json.dumps(snapshot)}\n\n"
                 time.sleep(STREAM_INTERVAL)
 
@@ -139,14 +157,14 @@ def create_web_app(wifi_state, ble_state, listener):
     return app
 
 
-def start_web_server(wifi_state, ble_state, listener):
+def start_web_server(modules, listener):
     """
     Run the Flask app in a daemon background thread. threaded=True allows
     multiple simultaneous /stream connections (phone + tablet, etc.).
     use_reloader=False is required since we're already inside a
     background thread.
     """
-    app = create_web_app(wifi_state, ble_state, listener)
+    app = create_web_app(modules, listener)
 
     def run():
         app.run(host=WEB_HOST, port=WEB_PORT, threaded=True, use_reloader=False)
