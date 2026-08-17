@@ -59,7 +59,7 @@ with open("dashboard.html", "r", encoding="utf-8") as f:
     DASHBOARD_HTML = f.read()
 
 
-def create_web_app(modules, listener):
+def create_web_app(modules, listener, hackrf_config):
     """
     Flask app factory.
 
@@ -154,17 +154,26 @@ def create_web_app(modules, listener):
         listener.switch_target(bssid, channel, essid)
         return jsonify({"ok": True})
 
+    @app.route("/api/hackrf/limits", methods=["POST"])
+    def update_spectrum_limits():
+        data = request.get_json(silent=True) or {}
+        left_bound = data.get("min")
+        right_bound = data.get("max")
+
+        hackrf_config.set_config(left_bound, right_bound)
+        return jsonify({"ok": True})
+
     return app
 
 
-def start_web_server(modules, listener):
+def start_web_server(modules, listener, hackrf_config):
     """
     Run the Flask app in a daemon background thread. threaded=True allows
     multiple simultaneous /stream connections (phone + tablet, etc.).
     use_reloader=False is required since we're already inside a
     background thread.
     """
-    app = create_web_app(modules, listener)
+    app = create_web_app(modules, listener, hackrf_config)
 
     def run():
         app.run(host=WEB_HOST, port=WEB_PORT, threaded=True, use_reloader=False)

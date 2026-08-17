@@ -41,7 +41,7 @@ import wifi_radar
 from wifi_radar import DiscoveryRadar, TargetListener
 from ble_capture import BleCapture
 from ble_radar import BleRadar
-from hackrf_capture import HackRfCapture
+from hackrf_capture import HackRfCapture, HackRfConfig
 from web_dashboard import WebState, start_web_server, WEB_PORT
 
 REFRESH_INTERVAL =2.0     # how often each radar publishes a fresh snapshot
@@ -185,6 +185,7 @@ def main():
     # --- HackRF setup -----------------------------------------------------------
     hackrf_capture = HackRfCapture()
     hackrf_capture.start_capture()
+    hackrf_listener = HackRfConfig(hackrf_capture)
 
     # --- Shared state + background threads ------------------------------
     modules = {}
@@ -207,7 +208,7 @@ def main():
     hackrf_thread.start()
 
     # --- Web dashboard -----------------------------------------------------
-    start_web_server(modules, listener)
+    start_web_server(modules, listener, hackrf_listener)
     print(f"Dashboard web disponible sur http://192.168.4.1:{WEB_PORT}/")
     print("Affichage terminal (debug) actif -- 'q' + Entree pour quitter.\n")
     time.sleep(1)  # let the first snapshots land before the first redraw

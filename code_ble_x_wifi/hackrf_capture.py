@@ -3,45 +3,79 @@ import queue
 import numpy as np
 import hackrf
 import time
+import math
+
+class HackRfConfig:
+
+    def __init__(self, hackrf_capture):
+        self.hackrf = hackrf_capture
+
+    def set_config(self, left_bound, right_bound):
+        self.hackrf.set_bounds(left_bound * 1000000, right_bound * 1000000)
+
+    def get_config(self):
+        return self.hackrf.get_bounds()
 
 
 class HackRfCapture:
 
     def __init__(self):
         # Configuration
-        self.start_frequency = 2.4e9
+        self.left_bound = 2.4e9
+        self.right_bound = 2.5e9
         self.sdr_baseband = 20e6
-        self.N = 2048
-        self.iterations = 5
+        self.N = 512
+        self.iterations = math.ceil((self.right_bound - self.left_bound) / self.sdr_baseband)
 
         self.last_chunks = []
         self.power = None
-        self.samples = None
-
         self.peak_values = []
         self.peak_times = []
+        self.samples = []
 
         self.q = queue.Queue()
         self.stop_event = threading.Event()
         self._reader_thread = None
+        self._config_lock = threading.Lock()
 
         # SDR
         self.hrf = hackrf.HackRF()
-        self.hrf.center_freq = self.start_frequency
+        self.hrf.center_freq = self.left_bound
         self.hrf.sample_rate = 20e6
+        self.DC_CORRECTION = 0
 
+        self.update_frequencies()
+
+    def update_frequencies(self):
         # Fréquences correspondant aux bins FFT
+        self.iterations = math.ceil((self.right_bound - self.left_bound) / self.sdr_baseband)
+
         self.freqs = np.fft.fftshift(
             np.fft.fftfreq(
                 self.N * self.iterations,
                 1 / self.hrf.sample_rate / self.iterations
             )
         ) + (
-            self.start_frequency
+            self.left_bound
             + self.sdr_baseband * self.iterations / 2
         )
 
-        self.DC_CORRECTION = 0
+    def set_bounds(self, left_bound, right_bound):
+        with self._config_lock:
+            self.stop_capture()
+
+            self.left_bound = left_bound
+            self.right_bound = right_bound
+            self.update_frequencies()
+
+            self.power = None
+            self.samples = []
+
+            self.start_capture()
+
+    def get_bounds(self):
+        with self._config_lock:
+            return self.left_bound, self.right_bound
 
     def build_snapshot(self):
         if self.power is None:
@@ -133,12 +167,12 @@ class HackRfCapture:
         samples_chunks = []
 
         center_frequency = (
-            self.start_frequency
+            self.left_bound
             + self.sdr_baseband / 2
         )
 
         while center_frequency < (
-            self.start_frequency
+            self.left_bound
             + self.sdr_baseband * self.iterations
         ):
 

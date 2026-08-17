@@ -75,6 +75,21 @@
   </table>
 
   <h2>Affichage du spectre et des valeurs de pic des 15 dernières secondes</h2>
+
+  <p>
+    Limite à gauche :
+    <input id="spectrum-min" type="number" step="20" value="0">
+  </p>
+
+  <p>
+    Limite à droite :
+    <input id="spectrum-max" type="number" step="20" value="1000">
+  </p>
+
+  <button type="button" onclick="updateSpectrumLimits()">
+    Appliquer
+  </button>
+
   <canvas id="graph-spectrum"></canvas>
 
   <script src="/chart.umd.min.js"></script>
@@ -195,11 +210,6 @@
       lastData["power-spectrum"] = snap.values_y;
       lastData["max_spectrum"] = snap.values_max;
 
-      console.log("HackRF reçu :", snap);
-      console.log("X :", snap.values_x);
-      console.log("Y :", snap.values_y);
-      console.log("PEAK :", snap.peak_values);
-
       renderGraphSpectrum(snap.values_y, snap.values_x, snap.values_max)
     }
 
@@ -316,7 +326,9 @@
                         type: "linear"
                     },
                     y: {
-                        type: "linear"
+                        type: "linear",
+                        min: -30,
+                        max: 30
                     }
                 }
             }
@@ -346,6 +358,36 @@
 
         spectrumChart.update();
     }
+
+    function updateSpectrumLimits() {
+        let min = parseInt(document.querySelector("#spectrum-min").value);
+        let max = parseInt(document.querySelector("#spectrum-max").value);
+
+        if (!Number.isFinite(min) || !Number.isFinite(max)) {
+            return;
+        }
+
+        min = Math.round(min / 20) * 20;
+        max = Math.round(max / 20) * 20;
+
+        if (min >= max) {
+            return;
+        }
+
+        document.querySelector("#spectrum-min").value = min;
+        document.querySelector("#spectrum-max").value = max;
+
+        // spectrumChart.options.scales.x.min = min;
+        // spectrumChart.options.scales.x.max = max;
+
+        console.log("Sending ", min, " and ", max) 
+
+        fetch('/api/hackrf/limits', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ min, max }),
+              });
+        }
   </script>
 </body>
 </html>
