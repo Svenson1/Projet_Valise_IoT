@@ -37,7 +37,8 @@ REFRESH_INTERVAL_S = 2.5
 CLEAR_SCREEN = "\x1b[2J\x1b[H"   # ANSI clear
 
 # Devices weaker than this are hidden None for desactivate.
-MIN_RSSI_DBM = -85
+MIN_RSSI_DBM = -70
+MAX_AGE_S = 0
 
 # --- Web dashboard settings -------------------------------------------------
 WEB_HOST = "0.0.0.0"  # toutes les interfaces, dont celle du hotspot Pi
@@ -75,9 +76,9 @@ def render(snapshot):
 def filter_snapshot(snapshot):
     """Applique MIN_RSSI_DBM. Utilise a la fois par le terminal et le web
     pour garder les deux affichages coherents."""
-    if MIN_RSSI_DBM is None:
+    if MIN_RSSI_DBM is None or MAX_AGE_S is None:
         return snapshot
-    return [d for d in snapshot if d["rssi"] is not None and d["rssi"] >= MIN_RSSI_DBM]
+    return [d for d in snapshot if d["rssi"] is not None and d["rssi"] >= MIN_RSSI_DBM and d["age_s"] is not None and d["age_s"] <= MAX_AGE_S]
 
 
 # =============================================================================

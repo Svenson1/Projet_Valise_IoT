@@ -39,12 +39,13 @@ from queue import Empty
 
 import wifi_radar
 from wifi_radar import DiscoveryRadar, TargetListener
-from ble_capture import BleCapture
+#from ble_capture import BleCapture
+from nrf_capture import BleCapture
 from ble_radar import BleRadar
 from hackrf_capture import HackRfCapture, HackRfConfig
 from web_dashboard import WebState, start_web_server, WEB_PORT
 
-REFRESH_INTERVAL =2.0     # how often each radar publishes a fresh snapshot
+REFRESH_INTERVAL = 0.5     # how often each radar publishes a fresh snapshot
 TERMINAL_TICK = 2.0        # how often the terminal display / keyboard loop wakes up
 
 
@@ -184,8 +185,11 @@ def main():
 
     # --- HackRF setup -----------------------------------------------------------
     hackrf_capture = HackRfCapture()
-    hackrf_capture.start_capture()
     hackrf_listener = HackRfConfig(hackrf_capture)
+    if hackrf_capture.available:
+        hackrf_capture.start_capture()
+    else:
+        print("HackRF unavailable, continuing without SDR.")
 
     # --- Shared state + background threads ------------------------------
     modules = {}

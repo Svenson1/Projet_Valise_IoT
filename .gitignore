@@ -2,3 +2,7 @@
 code_analyse_bluetooth/.venv/
 
 code_analyse_ble/__pycache__/
+
+code_ble_x_wifi/radar_csv/
+
+code_ble_x_wifi/__pycache__/

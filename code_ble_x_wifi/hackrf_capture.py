@@ -39,12 +39,22 @@ class HackRfCapture:
         self._config_lock = threading.Lock()
 
         # SDR
-        self.hrf = hackrf.HackRF()
-        self.hrf.center_freq = self.left_bound
-        self.hrf.sample_rate = 20e6
-        self.DC_CORRECTION = 0
+        try:
+            self.hrf = hackrf.HackRF()
 
-        self.update_frequencies()
+            self.hrf.center_freq = self.left_bound
+            self.hrf.sample_rate = 20e6
+            self.DC_CORRECTION = 0
+
+            self.update_frequencies()
+
+        except Exception as e:
+            print("Can't read HackRF:", e)
+            self.hrf = None
+
+    @property
+    def available(self):
+        return self.hrf is not None
 
     def update_frequencies(self):
         # Fréquences correspondant aux bins FFT

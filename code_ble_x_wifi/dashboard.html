@@ -92,6 +92,22 @@
 
   <canvas id="graph-spectrum"></canvas>
 
+  <h2>Liste des appareils Apple qui sont de potentiels Airtags</h2>
+  <table id="apple-devices">
+    <thead><tr>
+      <th class="sortable" data-key="address" data-type="string">Adresse<span class="arrow"></span></th>
+      <th class="sortable" data-key="label" data-type="string">Label<span class="arrow"></span></th>
+      <th class="sortable" data-key="rssi" data-type="number">RSSI<span class="arrow"></span></th>
+      <th class="sortable" data-key="distance_m" data-type="number">Distance<span class="arrow"></span></th>
+      <th class="sortable" data-key="trend" data-type="string">Tendance<span class="arrow"></span></th>
+      <th class="sortable" data-key="pdu_type" data-type="string">PDU<span class="arrow"></span></th>
+      <th class="sortable" data-key="last_channel" data-type="number">Ch<span class="arrow"></span></th>
+      <th class="sortable" data-key="seen_count" data-type="number">Vus<span class="arrow"></span></th>
+      <th class="sortable" data-key="age_s" data-type="number">AGE<span class="arrow"></span></th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+
   <script src="/chart.umd.min.js"></script>
 
   <script>
@@ -113,6 +129,7 @@
       networks: { key: null, state: 0 },
       stations: { key: null, state: 0 },
       'ble-devices': { key: null, state: 0 },
+      'apple-devices': { key: null, state: 0},
     };
     const lastData = {
       networks: [],
@@ -202,6 +219,7 @@
       const devices = JSON.parse(event.data);
       lastData['ble-devices'] = devices;
       renderBleDevices(devices);
+      renderAppleDevices(devices);
     };
 
     hackrfSource.onmessage = function(event) {
@@ -282,10 +300,30 @@
       }
     }
 
+    function renderAppleDevices(devices) {
+      const tbody = document.querySelector('#apple-devices tbody');
+      tbody.innerHTML = '';
+      for (const dev of applySort('apple-devices', devices)) {
+        console.log(dev.label);
+        if (dev.label != "(Apple)") { continue }
+
+        const row = document.createElement('tr');
+        const distStr = dev.distance_m != null ? `${dev.distance_m}m` : '?';
+        const trendStr = dev.trend || '?';
+        row.innerHTML = `<td>${dev.address}</td><td>${dev.label}</td>
+                          <td>${dev.rssi ?? '?'}</td><td>${distStr}</td>
+                          <td class="trend-${trendStr}">${trendStr}</td>
+                          <td>${dev.pdu_type ?? '?'}</td><td>${dev.last_channel ?? '?'}</td>
+                          <td>${dev.seen_count}</td><td>${dev.age_s}s</td>`;
+        tbody.appendChild(row);
+      }
+    }
+
     // Attacher les ecouteurs de clic une fois le DOM pret
     setupSortableHeaders('networks', renderNetworks);
     setupSortableHeaders('stations', renderStations);
     setupSortableHeaders('ble-devices', renderBleDevices);
+    setupSortableHeaders('apple-devices', renderAppleDevices);
 
 
     hackrfSource.onopen = function() {
